@@ -21,7 +21,7 @@
     hoursBetween: (a, b) => Math.round((new Date(b) - new Date(a)) / 36e5 * 10) / 10,
     rand: (min, max) => Math.floor(Math.random() * (max - min + 1)) + min,
     pick: (arr) => arr[Math.floor(Math.random() * arr.length)],
-    sum: (arr, fn) => arr.reduce((s, x) => s + (Number(fn ? fn(x) : x) || 0), 0),
+    sum: (arr, fn) => arr.reduce((s, x) => s + (Number(typeof fn === 'function' ? fn(x) : fn ? x[fn] : x) || 0), 0),
     groupBy: (arr, fn) => arr.reduce((m, x) => { const k = typeof fn === 'function' ? fn(x) : x[fn]; (m[k] = m[k] || []).push(x); return m; }, {}),
     countBy: (arr, fn) => arr.reduce((m, x) => { const k = typeof fn === 'function' ? fn(x) : x[fn]; m[k] = (m[k] || 0) + 1; return m; }, {}),
     pct: (a, b) => (b ? Math.round((a / b) * 1000) / 10 : 0),
