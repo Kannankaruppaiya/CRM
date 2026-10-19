@@ -44,8 +44,8 @@
       { label: 'Orders won', value: s ? fmt.lakh(s.wonValue) : '—', meta: s ? s.wonCount + ' orders' : '', color: 'var(--ok)' },
       { label: 'Outstanding', value: s ? fmt.lakh(s.outstanding) : '—', meta: s ? 'Collected this month ' + fmt.lakh(s.collectedThisMonth) : '', color: 'var(--warn)' },
       { label: 'Active projects', value: p ? p.active : '—', meta: p ? p.overdue + ' overdue · ' + p.materialShort + ' material short' : '', color: 'var(--div-security)' },
-      { label: 'Open service calls', value: v ? v.openCalls : '—', meta: v ? v.overdueCalls + ' overdue' : '', color: 'var(--violet)' },
-      { label: 'Attendance SLA', value: v ? fmt.pct(v.attendanceSla) : '—', meta: v ? 'Resolution SLA ' + fmt.pct(v.resolutionSla) : '', color: 'var(--info)' },
+      { label: 'Open service calls', value: v ? v.openCalls : '—', meta: v ? v.overdueCalls + ' overdue' : '', color: 'var(--chart-4)' },
+      { label: 'Attendance SLA', value: v ? fmt.pct(v.attendanceSla) : '—', meta: v ? 'Resolution SLA ' + fmt.pct(v.resolutionSla) : '', color: 'var(--chart-5)' },
       { label: 'Open violations', value: v ? v.openViolations : '—', meta: 'Policy compliance', color: 'var(--bad)', onClick: () => CRM.canSee('violations') && CRM.go('violations') },
     ]));
 
@@ -78,7 +78,7 @@
       { label: 'Notifications', value: db.all('notifications').length },
     ]));
     el.appendChild(h('div', { class: 'grid g2' }, [
-      ui.card('Records per collection', ui.hbars(cols.map((c) => ({ label: c, value: db.all(c).length, color: 'var(--brand)' })))),
+      ui.card('Records per collection', ui.hbars(cols.map((c) => ({ label: c, value: db.all(c).length, color: 'var(--chart-1)' })))),
       ui.card('Users per role', ui.hbars(CRM.roles.map((r) => ({ label: r.name, value: staff.filter((s) => s.role === r.id).length, color: r.color })))),
     ]));
     el.appendChild(h('div', { class: 'mt' }, ui.card('Quick links', h('div', { class: 'row' }, [ui.btn('Users & access', () => CRM.go('users'), 'primary'), ui.btn('Master data', () => CRM.go('masters')), ui.btn('Audit log', () => CRM.go('audit')), ui.btn('Role design guide', () => CRM.go('roleguide'))]))));

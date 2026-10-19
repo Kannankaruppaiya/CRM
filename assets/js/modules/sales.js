@@ -11,7 +11,7 @@
   // ============================================================ constants (Sales.pdf)
   const STAGES = ['Enquiry Received', 'Contact Made', 'Site Visit Scheduled', 'Site Visit Completed', 'Quotation Sent', 'Negotiation', 'Order Won', 'Order Lost'];
   const OPEN = STAGES.slice(0, 6);
-  const STAGE_COLORS = ['var(--chart-6)', 'var(--info)', 'var(--violet)', 'var(--chart-4)', 'var(--brand)', 'var(--warn)', 'var(--ok)', 'var(--bad)'];
+  const STAGE_COLORS = ['var(--chart-5)', 'var(--steel)', 'var(--chart-1)', 'var(--chart-4)', 'var(--div-security)', 'var(--warn)', 'var(--ok)', 'var(--bad)'];
   const DIVS = ['Power', 'Electronic Security', 'Solar'];
   // Sales channels: existing-customer business and new-customer business
   const CHANNELS = ['OTS', 'Office Walk-in', 'Upselling & Cross Selling', 'Cold Calling', 'Digital Marketing', 'Referral Sales', 'Advertisements', 'Business Forums'];
@@ -98,7 +98,7 @@
   const invTone = (s) => ({ Paid: 'ok', Overdue: 'bad', 'Due Today': 'warn', Partial: 'warn', Unpaid: 'info' }[s] || '');
   const ageBucket = (inv) => { const d = overdueDays(inv); return d <= 0 ? 'Not due' : d <= 30 ? '1-30 days' : d <= 60 ? '31-60 days' : d <= 90 ? '61-90 days' : '90+ days'; };
   const BUCKETS = ['Not due', '1-30 days', '31-60 days', '61-90 days', '90+ days'];
-  const BUCKET_COLORS = ['var(--ok)', 'var(--info)', 'var(--warn)', 'var(--chart-3)', 'var(--bad)'];
+  const BUCKET_COLORS = ['var(--ok)', 'var(--chart-5)', 'var(--warn)', 'var(--chart-3)', 'var(--bad)'];
 
   // ---------- orders
   const quotesOf = (enqId) => db.find('quotations', (q) => q.enquiryId === enqId);
@@ -178,6 +178,12 @@
     if (!e) return;
     db.update('enquiries', e.id, { comms: (e.comms || []).concat([{ at: nowIso(), channel, to, text, by: CRM.user().name }]) }, { note: channel + ' sent to ' + to });
   }
+  // Brand voice: real names, short and clear, bilingual (English + Tamil), signed "Team Maruthi".
+  function waEnquiryText(e) {
+    const name = e.contactName || 'there';
+    return 'Hello ' + name + ', thanks for your enquiry (' + e.id + ') for ' + e.product + '. ' + (e.execId ? execName(e.execId) + ' from Maruthi' : 'Our team') + ' will call you shortly. — Team Maruthi'
+      + '\n\nவணக்கம் ' + name + ', உங்கள் ' + e.product + ' விசாரணை (' + e.id + ') பெறப்பட்டது. மாருதி குழு விரைவில் உங்களை தொடர்பு கொள்ளும். — மாருதி குழு';
+  }
   function sendWhatsApp(enqId, phone, text) {
     const p = digits(phone);
     window.open('https://wa.me/91' + p + '?text=' + encodeURIComponent(text), '_blank');
@@ -194,7 +200,7 @@
   function commButtons(e, text, subject) {
     if (!canWork()) return [];
     return [
-      ui.btn('💬 WhatsApp', () => sendWhatsApp(e.id, e.contactNumber, text || ('Dear ' + (e.contactName || 'Sir/Madam') + ', greetings from Maruthi Power Control Systems regarding your enquiry ' + e.id + ' (' + e.product + ').')), 'sm'),
+      ui.btn('💬 WhatsApp', () => sendWhatsApp(e.id, e.contactNumber, text || waEnquiryText(e)), 'sm'),
       ui.btn('✉ Email', () => sendEmail(e.id, e.email, subject || ('Maruthi Power – ' + e.id), text || ('Dear ' + (e.contactName || 'Sir/Madam') + ',\n\nThank you for your enquiry for ' + e.product + '.\n\nRegards,\n' + CRM.user().name + '\nMaruthi Power Control Systems')), 'sm'),
     ];
   }
@@ -914,11 +920,11 @@
     const open = list.filter((e) => OPEN.includes(e.stage)), won = list.filter((e) => e.stage === 'Order Won'), lost = list.filter((e) => e.stage === 'Order Lost');
     el.appendChild(ui.kpis([
       { label: 'Enquiries this month', value: list.filter((e) => monthKey(e.date) === mk).length, meta: list.length + ' total' },
-      { label: 'Open prospects', value: open.length, meta: fmt.lakh(sum(open, 'expectedValue')) + ' pipeline', color: 'var(--info)' },
+      { label: 'Open prospects', value: open.length, meta: fmt.lakh(sum(open, 'expectedValue')) + ' pipeline', color: 'var(--chart-5)' },
       { label: 'Won', value: won.length, meta: 'Conversion ' + fmt.pct(util.pct(won.length, won.length + lost.length)), tone: 'up', color: 'var(--ok)' },
       { label: 'Lost', value: lost.length, color: 'var(--bad)' },
       { label: 'Follow-ups overdue', value: open.filter((e) => e.nextFollowUp && e.nextFollowUp < todayIso()).length, color: 'var(--warn)', onClick: () => CRM.go('followups') },
-      !isExec() ? { label: 'Awaiting assignment', value: db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage)).length, color: 'var(--violet)' } : null,
+      !isExec() ? { label: 'Awaiting assignment', value: db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage)).length, color: 'var(--chart-4)' } : null,
     ].filter(Boolean)));
     const tabs = [{ id: 'all', label: 'All', count: list.length }, { id: 'open', label: 'Open', count: open.length }, { id: 'won', label: 'Won', count: won.length }, { id: 'lost', label: 'Lost', count: lost.length }];
     if (isCoord()) tabs.push({ id: 'assign', label: 'Assignment & Sales OTS', count: db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage)).length + pendingOts().length });
@@ -1006,7 +1012,7 @@
       if (tid === 'fu') body.appendChild(card(null, followUpTable(fus, { search: false }), { flush: true }));
       if (tid === 'q') body.appendChild(card(null, quoteTable(quotes, { search: false }), { flush: true }));
       if (tid === 'o') body.appendChild(o ? orderSummary(o) : ui.empty(open ? 'No order yet — move the enquiry to "Order Won" to create the sale order.' : 'No order for this enquiry.', '📦'));
-      if (tid === 'c') body.appendChild(card(null, (e.comms || []).length ? ui.timeline(e.comms.slice().reverse().map((c) => ({ when: fmt.dateTime(c.at) + ' · ' + c.by, title: c.channel + ' → ' + (c.to || '—'), body: c.text, color: c.channel === 'WhatsApp' ? 'var(--ok)' : 'var(--info)' }))) : ui.empty('No communications logged yet. Use WhatsApp / Email above.', '💬')));
+      if (tid === 'c') body.appendChild(card(null, (e.comms || []).length ? ui.timeline(e.comms.slice().reverse().map((c) => ({ when: fmt.dateTime(c.at) + ' · ' + c.by, title: c.channel + ' → ' + (c.to || '—'), body: c.text, color: c.channel === 'WhatsApp' ? 'var(--ok)' : 'var(--chart-5)' }))) : ui.empty('No communications logged yet. Use WhatsApp / Email above.', '💬')));
       if (tid === 'u') body.appendChild(card(null, upsellTable(ups, { search: false }), { flush: true, actions: work ? [ui.btn('+ Upsell / cross-sell', () => upsellModal({ enquiryId: e.id, customerId: e.customerId, accountName: e.accountName, baseProduct: e.product, orderId: o ? o.id : '' }), 'sm')] : null }));
       if (tid === 'h') body.appendChild(card(null, ui.timeline((e.stageHistory || []).slice().reverse().map((s) => ({ when: fmt.dateTime(s.at) + ' · ' + (s.by || ''), title: s.stage, body: s.note, color: STAGE_COLORS[STAGES.indexOf(s.stage)] })))));
       if (tid === 'a') body.appendChild(card(null, ui.auditTrail('enquiries', e.id)));
@@ -1030,7 +1036,7 @@
       const open = items.filter((e) => OPEN.includes(e.stage));
       kp.innerHTML = '';
       kp.appendChild(ui.kpis([
-        { label: 'Open opportunities', value: open.length }, { label: 'Pipeline value', value: fmt.lakh(sum(open, 'expectedValue')), color: 'var(--info)' },
+        { label: 'Open opportunities', value: open.length }, { label: 'Pipeline value', value: fmt.lakh(sum(open, 'expectedValue')), color: 'var(--chart-5)' },
         { label: 'In negotiation', value: fmt.lakh(sum(open.filter((e) => e.stage === 'Negotiation'), 'expectedValue')), color: 'var(--warn)' },
         { label: 'Follow-ups overdue', value: open.filter((e) => e.nextFollowUp && e.nextFollowUp < todayIso()).length, color: 'var(--bad)' },
       ]));
@@ -1085,7 +1091,7 @@
     const pendingResp = list.filter((q) => q.status === 'Sent' && q.quoteDate && util.daysBetween(q.quoteDate, CRM.TODAY) >= SLA.quoteResponseDays);
     el.appendChild(ui.kpis([
       { label: 'Quotes given this month', value: given.length, meta: fmt.lakh(sum(given, 'quoteValue')) },
-      { label: 'Avg quote response time', value: hrsText(avg(resp)), meta: util.pct(resp.filter((x) => x <= 24).length, resp.length) + '% within 24 h', color: 'var(--info)' },
+      { label: 'Avg quote response time', value: hrsText(avg(resp)), meta: util.pct(resp.filter((x) => x <= 24).length, resp.length) + '% within 24 h', color: 'var(--chart-5)' },
       { label: 'Awaiting Sales Manager approval', value: awaiting.length, color: 'var(--warn)' },
       { label: 'Customer response pending', value: pendingResp.length, meta: '> ' + SLA.quoteResponseDays + ' days since sent', color: 'var(--bad)' },
       { label: 'Under discussion', value: fmt.lakh(sum(list.filter((q) => q.status === 'Under Discussion'), 'quoteValue')), color: 'var(--chart-4)' },
@@ -1235,7 +1241,7 @@
     el.appendChild(ui.kpis([
       { label: 'Orders won this month', value: mon.length, meta: fmt.lakh(sum(mon, 'value')), color: 'var(--ok)' },
       { label: 'Awaiting SO approval', value: live.filter((o) => o.approval === 'Awaiting Approval').length, color: 'var(--warn)' },
-      { label: 'Avg SO processing time', value: hrsText(avg(so)), meta: so.filter((x) => x > 24).length + ' over 24 h', color: 'var(--info)' },
+      { label: 'Avg SO processing time', value: hrsText(avg(so)), meta: so.filter((x) => x > 24).length + ' over 24 h', color: 'var(--chart-5)' },
       { label: 'Pending delivery / installation', value: delivery.length, color: 'var(--chart-4)' },
       { label: 'To be invoiced', value: live.filter((o) => o.approval === 'Approved' && !invoicesOf(o.id).length).length, color: 'var(--bad)' },
     ]));
@@ -1388,7 +1394,7 @@
       { label: 'Due today', value: planned.filter((f) => f.dueDate === t).length, color: 'var(--warn)' },
       { label: 'Missed (overdue)', value: planned.filter((f) => f.dueDate < t).length, color: 'var(--bad)' },
       { label: 'Completed today', value: list.filter((f) => f.status === 'Completed' && util.iso(f.completedAt) === t).length, color: 'var(--ok)' },
-      { label: 'Upcoming 7 days', value: planned.filter((f) => f.dueDate > t && util.daysBetween(CRM.TODAY, f.dueDate) <= 7).length, color: 'var(--info)' },
+      { label: 'Upcoming 7 days', value: planned.filter((f) => f.dueDate > t && util.daysBetween(CRM.TODAY, f.dueDate) <= 7).length, color: 'var(--chart-5)' },
       { label: 'Completed vs planned (month)', value: monthDone.length + ' / ' + monthPlanned.length, meta: fmt.pct(util.pct(monthDone.length, monthPlanned.length)) + ' discipline' },
     ]));
     el.appendChild(ui.tabs([{ id: 'today', label: 'Daily task list' }, { id: 'sched', label: 'Scheduler (next 7 days)' }, { id: 'missed', label: 'Missed', count: planned.filter((f) => f.dueDate < t).length }, { id: 'up', label: 'Upcoming', count: planned.filter((f) => f.dueDate >= t).length }, { id: 'done', label: 'Completed' }], (id, body) => {
@@ -1400,7 +1406,7 @@
         const items = planned.filter((f) => f.dueDate < t || days.includes(f.dueDate));
         body.appendChild(ui.callout('Drag a follow-up to another day to reschedule it. Overdue items must be moved to today or later.', 'info'));
         body.appendChild(h('div', { class: 'mt' }, ui.kanban({
-          columns: [{ id: 'overdue', label: 'Overdue', color: 'var(--bad)' }].concat(days.map((d, i) => ({ id: d, label: i === 0 ? 'Today' : new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' }), color: i === 0 ? 'var(--warn)' : 'var(--info)' }))),
+          columns: [{ id: 'overdue', label: 'Overdue', color: 'var(--bad)' }].concat(days.map((d, i) => ({ id: d, label: i === 0 ? 'Today' : new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' }), color: i === 0 ? 'var(--warn)' : 'var(--chart-5)' }))),
           items, colOf: (f) => (f.dueDate < t ? 'overdue' : f.dueDate),
           card: (f) => [h('div', { class: 't' }, f.accountName), h('div', { class: 'small muted' }, f.type + ' · ' + f.purpose), h('div', { class: 'small' }, execName(f.execId))],
           onMove: canWork() ? (f, to) => { if (to === 'overdue') { ui.toast('Cannot move into Overdue', 'bad'); return; } rescheduleFollowUp(db.get('followups', f.id), to); } : null,
@@ -1445,7 +1451,7 @@
     el.appendChild(ui.kpis([
       { label: 'Calls today', value: callCount(today), meta: 'Target ' + Math.round((tgtM.calls || 0) / 26) + '/day' },
       { label: 'Cold calls today vs target', value: callCount(today.filter((c) => c.type === 'Cold Call')) + ' / ' + dailyCold, color: 'var(--chart-4)' },
-      { label: 'Cold calls this month', value: monthCold + ' / ' + (tgtM.coldCalls || 0), meta: fmt.pct(util.pct(monthCold, tgtM.coldCalls)) + ' of target', color: 'var(--info)' },
+      { label: 'Cold calls this month', value: monthCold + ' / ' + (tgtM.coldCalls || 0), meta: fmt.pct(util.pct(monthCold, tgtM.coldCalls)) + ' of target', color: 'var(--chart-5)' },
       { label: 'Enquiries from calls (month)', value: list.filter((c) => c.outcome === 'Enquiry Generated' && monthKey(c.date) === mk).length, color: 'var(--ok)' },
     ]));
     const days = [...Array(14)].map((_, i) => util.iso(util.addDays(CRM.TODAY, i - 13)));
@@ -1557,8 +1563,8 @@
     ui.page(el, { title: 'Upselling & Cross Selling', sub: 'Auto-suggested on every approved sale order (e.g. UPS → batteries / stabilizer) · value and executive responsible tracked', actions: [canWork() ? ui.btn('+ Opportunity', () => upsellModal(), 'primary') : null] });
     el.appendChild(ui.kpis([
       { label: 'Open opportunities', value: list.filter((u) => ['Suggested', 'Offered'].includes(u.status)).length, meta: fmt.lakh(sum(list.filter((u) => ['Suggested', 'Offered'].includes(u.status)), 'value')) },
-      { label: 'Upsells converted (month)', value: conv.filter((u) => u.type === 'Upsell' && monthKey(u.convertedAt) === mk).length, color: 'var(--violet)' },
-      { label: 'Cross-sells converted (month)', value: conv.filter((u) => u.type === 'Cross-sell' && monthKey(u.convertedAt) === mk).length, color: 'var(--brand)' },
+      { label: 'Upsells converted (month)', value: conv.filter((u) => u.type === 'Upsell' && monthKey(u.convertedAt) === mk).length, color: 'var(--chart-4)' },
+      { label: 'Cross-sells converted (month)', value: conv.filter((u) => u.type === 'Cross-sell' && monthKey(u.convertedAt) === mk).length, color: 'var(--chart-1)' },
       { label: 'Converted value (all time)', value: fmt.lakh(sum(conv, 'value')), color: 'var(--ok)' },
       { label: 'Conversion rate', value: fmt.pct(util.pct(conv.length, list.filter((u) => u.status !== 'Suggested').length)) },
     ]));
@@ -1612,7 +1618,7 @@
     const X = (p) => 20 + (p.lng - c) / (d - c) * 360, Y = (p) => 180 - (p.lat - a) / (b - a) * 160;
     let svg = '<svg viewBox="0 0 400 200"><rect x="0" y="0" width="400" height="200" rx="8" fill="var(--surface-3)"/>';
     svg += '<polyline fill="none" stroke="var(--brand)" stroke-width="2" stroke-dasharray="5 4" points="' + pts.map((p) => X(p) + ',' + Y(p)).join(' ') + '"/>';
-    pts.forEach((p, i) => { const last = i === pts.length - 1 && chk.checkOutLoc; svg += '<circle cx="' + X(p) + '" cy="' + Y(p) + '" r="7" fill="' + (i === 0 ? 'var(--ok)' : last ? 'var(--bad)' : 'var(--brand)') + '"><title>' + (i === 0 ? 'Check-in' : last ? 'Check-out' : 'Visit ' + i) + ' ' + p.lat + ',' + p.lng + '</title></circle><text x="' + (X(p) + 9) + '" y="' + (Y(p) + 4) + '">' + (i === 0 ? 'IN' : last ? 'OUT' : i) + '</text>'; });
+    pts.forEach((p, i) => { const last = i === pts.length - 1 && chk.checkOutLoc; svg += '<circle cx="' + X(p) + '" cy="' + Y(p) + '" r="7" fill="' + (i === 0 ? 'var(--ok)' : last ? 'var(--bad)' : 'var(--chart-1)') + '"><title>' + (i === 0 ? 'Check-in' : last ? 'Check-out' : 'Visit ' + i) + ' ' + p.lat + ',' + p.lng + '</title></circle><text x="' + (X(p) + 9) + '" y="' + (Y(p) + 4) + '">' + (i === 0 ? 'IN' : last ? 'OUT' : i) + '</text>'; });
     return h('div', { class: 'chart', html: svg + '</svg><div class="legend"><span><i style="background:var(--ok)"></i>Check-in</span><span><i style="background:var(--brand)"></i>Visits</span><span><i style="background:var(--bad)"></i>Check-out</span></div>' });
   }
   function renderMobile(el) {
@@ -1638,8 +1644,8 @@
       const chk = todayCheckin(me());
       if (view === 'home') {
         const tasks = dailyTasks();
-        screen.appendChild(h('div', { style: 'background:linear-gradient(135deg,var(--brand),#23315a);color:#fff;padding:18px 16px 16px' }, [
-          h('div', { class: 'small', style: 'opacity:.8' }, fmt.date(new Date()) + ' · MPCS Sales'),
+        screen.appendChild(h('div', { style: 'background:linear-gradient(105deg,var(--power-black) 72%,var(--maruthi-red) 72%);color:#fff;padding:18px 16px 16px' }, [
+          h('div', { class: 'small', style: 'opacity:.8' }, fmt.date(new Date()) + ' · Maruthi Sales'),
           h('h2', { style: 'margin:4px 0 2px' }, 'Hi, ' + CRM.user().name.split(' ')[0]),
           h('div', { class: 'small', style: 'opacity:.9' }, chk ? (chk.checkOutAt ? 'Checked out at ' + new Date(chk.checkOutAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : 'On field since ' + new Date(chk.checkInAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })) : 'Not checked in'),
         ]));
@@ -1733,7 +1739,7 @@
     },
     leads: {
       label: 'Lead history', header: ['Enquiry Date', 'Account Name', 'Contact Name', 'Contact Number', 'Email', 'Area', 'Segment', 'Division', 'Product', 'Quantity', 'Expected Value', 'Source', 'Lead Source', 'Source Details', 'Sales Stage', 'Executive Name', 'Remarks'],
-      sample: [['12/08/2026', 'Kovai Medical Center', 'Mohan S', '9843012345', '', 'Peelamedu', 'Healthcare', 'Power', 'MPCS Online UPS 10KVA', '2', '270000', 'Office Walk-in', 'Walk-in', 'Migrated from Excel', 'Negotiation', 'Deepak S', 'Old CRM lead'], ['03/09/2026', 'New Horizon Apartments', 'Selvam R', '9790011223', 'sec@newhorizon.in', 'Saravanampatti', 'Residential', 'Electronic Security', 'IP Dome Camera 4MP', '24', '120000', 'Digital Marketing', 'Website', 'Website form', 'Contact Made', '', '']],
+      sample: [['12/08/2026', 'Kovai Medical Center', 'Mohan S', '9843012345', '', 'Peelamedu', 'Healthcare', 'Power', 'Maruthi Online UPS 10KVA', '2', '270000', 'Office Walk-in', 'Walk-in', 'Migrated from Excel', 'Negotiation', 'Deepak S', 'Old CRM lead'], ['03/09/2026', 'New Horizon Apartments', 'Selvam R', '9790011223', 'sec@newhorizon.in', 'Saravanampatti', 'Residential', 'Electronic Security', 'IP Dome Camera 4MP', '24', '120000', 'Digital Marketing', 'Website', 'Website form', 'Contact Made', '', '']],
       check(r) {
         const division = matchOpt(pickField(r, 'Division'), DIVS);
         const pname = pickField(r, 'Product');
@@ -1810,10 +1816,10 @@
     ui.page(el, { title: 'Invoices', sub: 'Accounts raises & updates invoices after SO approval — invoice date, number, value, hard copy, mail and confirmation tracked', actions: [ui.btn('⇩ Export CSV', () => downloadCsv('invoices.csv', ['Invoice Number', 'Invoice Date', 'SO Number', 'Account', 'Division', 'Invoice Value', 'Payment Terms', 'Payment Due Date', 'Received', 'Outstanding', 'Hard Copy Submitted', 'Invoice Mailed', 'Confirmed With', 'Status'], invs.map((i) => [i.invoiceNo, i.invoiceDate, i.soNumber, i.accountName, i.division, i.value, i.paymentTerms, i.dueDate, paidOf(i), outstandingOf(i), i.hardCopySubmitted ? 'Yes' : 'No', i.invoiceMailed ? 'Yes' : 'No', i.confirmedWith, invStatus(i)])))] });
     el.appendChild(ui.kpis([
       { label: 'To be invoiced', value: toInv.length, meta: fmt.lakh(sum(toInv, (o) => o.value * 1.18)) + ' incl. GST', color: 'var(--warn)' },
-      { label: 'Invoiced this month', value: fmt.lakh(sum(invs.filter((i) => monthKey(i.invoiceDate) === mk), 'value')), color: 'var(--info)' },
+      { label: 'Invoiced this month', value: fmt.lakh(sum(invs.filter((i) => monthKey(i.invoiceDate) === mk), 'value')), color: 'var(--chart-5)' },
       { label: 'Hard copy not submitted', value: invs.filter((i) => !i.hardCopySubmitted && outstandingOf(i) > 0).length, color: 'var(--chart-4)' },
       { label: 'Not mailed', value: invs.filter((i) => !i.invoiceMailed).length, color: 'var(--chart-3)' },
-      { label: 'Service charges to collect', value: fmt.lakh(sum(invs.filter((i) => i.source === 'Service'), outstandingOf)), color: 'var(--violet)' },
+      { label: 'Service charges to collect', value: fmt.lakh(sum(invs.filter((i) => i.source === 'Service'), outstandingOf)), color: 'var(--chart-4)' },
     ]));
     el.appendChild(ui.tabs([{ id: 'to', label: 'To be invoiced', count: toInv.length }, { id: 'all', label: 'Invoices', count: invs.length }], (id, body) => {
       if (id === 'to') body.appendChild(card(null, ui.table({ rows: toInv, empty: 'All approved sale orders are invoiced', columns: [{ key: 'soNumber', label: 'SO number', render: (o) => mono(o.soNumber) }, { key: 'soIssuedDate', label: 'SO issued', render: (o) => fmt.date(o.soIssuedDate) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (o) => ui.divTag(o.division) }, { key: 'product', label: 'Product' }, { key: 'value', label: 'Value (ex-GST)', cls: 'right', render: (o) => fmt.money(o.value) }, { key: 'paymentTerms', label: 'Terms' }, { key: 'waiting', label: 'Waiting', render: (o) => ui.badge(fmt.rel(o.soIssuedDate), util.daysBetween(o.soIssuedDate, CRM.TODAY) > 2 ? 'bad' : 'info') }], actions: isAcc() ? (o) => [ui.btn('Raise invoice', () => raiseInvoice(db.get('orders', o.id)), 'sm primary')] : null }), { flush: true }));
@@ -1833,7 +1839,7 @@
       { label: 'Collected this month', value: fmt.lakh(sum(pays.filter((p) => monthKey(p.receivedDate) === mk), 'value')), meta: util.pct(pays.filter((p) => monthKey(p.receivedDate) === mk && p.onTime).length, pays.filter((p) => monthKey(p.receivedDate) === mk).length) + '% as per policy', color: 'var(--ok)' },
       { label: 'Due today', value: fmt.lakh(sum(invs.filter((i) => util.iso(i.dueDate) === t), outstandingOf)), color: 'var(--warn)' },
       { label: 'Overdue', value: fmt.lakh(sum(overdue, outstandingOf)), meta: overdue.length + ' invoices', color: 'var(--bad)' },
-      { label: 'Field updates to verify', value: pays.filter((p) => !p.verified).length, color: 'var(--violet)' },
+      { label: 'Field updates to verify', value: pays.filter((p) => !p.verified).length, color: 'var(--chart-4)' },
     ]));
     if (dueSoon.length || overdue.length) el.appendChild(ui.callout('<b>Payment-due alerts:</b> ' + dueSoon.length + ' invoice(s) due within 3 days (' + fmt.lakh(sum(dueSoon, outstandingOf)) + ') and ' + overdue.length + ' overdue beyond credit policy (' + fmt.lakh(sum(overdue, outstandingOf)) + '). Reminders go to Accounts and the executive automatically.', overdue.length ? 'bad' : 'warn'));
     section(el, ui.tabs([{ id: 'track', label: 'Payment tracking' }, { id: 'due', label: 'Due & overdue', count: dueSoon.length + overdue.length }, { id: 'rcpt', label: 'Receipts', count: pays.length }], (id, body) => {
@@ -1868,7 +1874,7 @@
       rows: () => invs.map((i) => Object.assign({}, i, { os: outstandingOf(i), od: Math.max(0, overdueDays(i)), bucket: ageBucket(i), execName: execName(i.execId) })).sort((a, b) => b.od - a.od),
       filters: [{ key: 'bucket', label: 'buckets', options: BUCKETS }, { key: 'division', label: 'divisions', options: DIVS }],
       columns: [{ key: 'invoiceNo', label: 'Invoice', render: (i) => mono(i.invoiceNo) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (i) => ui.divTag(i.division) }, { key: 'dueDate', label: 'Due', render: (i) => fmt.date(i.dueDate) }, { key: 'od', label: 'Days overdue', render: (i) => ui.badge(i.od ? i.od + ' d' : 'Not due', i.od > 60 ? 'bad' : i.od > 0 ? 'warn' : 'ok') }, { key: 'os', label: 'Outstanding', cls: 'right', render: (i) => fmt.money(i.os), footer: (rs) => fmt.lakh(sum(rs, 'os')) }, { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'execName', label: 'Executive' }],
-      actions: (i) => { const e = db.one('enquiries', (x) => x.id === (db.get('orders', i.orderId) || {}).enquiryId) || { id: '', contactNumber: (master.customer(i.customerId) || {}).phone, email: (master.customer(i.customerId) || {}).email }; const txt = 'Gentle reminder: invoice ' + i.invoiceNo + ' for ' + fmt.money(i.os) + ' was due on ' + fmt.date(i.dueDate) + '. Kindly arrange payment. – Maruthi Power Control Systems, Accounts'; return [ui.btn('💬', () => sendWhatsApp(e.id, e.contactNumber, txt), 'sm'), ui.btn('✉', () => sendEmail(e.id, e.email, 'Payment reminder ' + i.invoiceNo, txt), 'sm'), (isAcc() || canWork()) ? ui.btn('₹', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null]; },
+      actions: (i) => { const e = db.one('enquiries', (x) => x.id === (db.get('orders', i.orderId) || {}).enquiryId) || { id: '', contactNumber: (master.customer(i.customerId) || {}).phone, email: (master.customer(i.customerId) || {}).email }; const txt = 'A gentle reminder: invoice ' + i.invoiceNo + ' for ' + fmt.money(i.os) + (new Date(i.dueDate) < CRM.TODAY ? ' was due on ' : ' is due on ') + fmt.date(i.dueDate) + '. — Team Maruthi, Accounts'; return [ui.btn('💬', () => sendWhatsApp(e.id, e.contactNumber, txt), 'sm'), ui.btn('✉', () => sendEmail(e.id, e.email, 'Payment reminder ' + i.invoiceNo, txt), 'sm'), (isAcc() || canWork()) ? ui.btn('₹', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null]; },
     }), { flush: true }));
   }
 
@@ -1951,7 +1957,7 @@
     const qr = qs.map(quoteResponseHrs), sp = os.map(soProcessingHrs).filter((x) => x != null), cv = os.map(conversionDays).filter((x) => x != null);
     ui.page(el, { title: 'Sales Cycle Times', sub: 'Automatically calculated: quote response time (enquiry → quote given), SO processing time (order won → SO issued), lead conversion time (enquiry → order won)' });
     el.appendChild(ui.kpis([
-      { label: 'Avg quote response time', value: hrsText(avg(qr)), meta: util.pct(qr.filter((x) => x <= 24).length, qr.length) + '% within 24 h SLA', color: 'var(--info)' },
+      { label: 'Avg quote response time', value: hrsText(avg(qr)), meta: util.pct(qr.filter((x) => x <= 24).length, qr.length) + '% within 24 h SLA', color: 'var(--chart-5)' },
       { label: 'Avg SO processing time', value: hrsText(avg(sp)), meta: util.pct(sp.filter((x) => x <= 24).length, sp.length) + '% within 24 h', color: 'var(--chart-4)' },
       { label: 'Avg lead conversion time', value: (Math.round((avg(cv) || 0) * 10) / 10) + ' days', meta: cv.length + ' won orders', color: 'var(--ok)' },
     ]));
@@ -1976,7 +1982,7 @@
       h('div', { class: 'span2' }, card('Open violations', ui.table({ rows: list.map((b) => ({ id: b.rec.id, type: b.type, ref: b.ref, division: b.division, owner: execName(b.owner), over: b.over, level: LEVELS[b.level].label, lv: b.level, severity: b.severity, details: b.details, link: b.link })), onRow: (r) => { location.hash = r.link; }, filters: [{ key: 'type', label: 'types', options: types }, { key: 'division', label: 'divisions', options: DIVS }], columns: [{ key: 'type', label: 'Violation', render: (r) => h('div', {}, [h('b', {}, r.type), h('div', { class: 'small muted' }, r.ref)]) }, { key: 'id', label: 'Record', render: (r) => mono(r.id) }, { key: 'division', label: 'Division', render: (r) => ui.divTag(r.division) }, { key: 'owner', label: 'Owner' }, { key: 'over', label: 'Over SLA by', render: (r) => hrsText(r.over), sort: (r) => r.over }, { key: 'level', label: 'Escalated to', render: (r) => ui.badge(r.level, r.lv >= 3 ? 'bad' : 'warn') }, { key: 'severity', label: 'Severity', render: (r) => ui.badge(r.severity, r.severity === 'Low' ? 'info' : 'warn') }, { key: 'details', label: 'Details' }] }), { flush: true })),
       h('div', { class: 'stack' }, [
         card('Policy rules (Service_requirement §4–5)', ui.dl([['4.1 Quotation delay', 'No quotation 24 h after enquiry'], ['4.2 Site visit delay', 'Site visit not done in 24 h'], ['4.3 Customer approval pending SO', 'SO not issued 24 h after customer approval'], ['5.2 Payment collection delay', 'Not received within customer credit days'], ['5.3 Scrap collection delay', 'Scrap not collected 24 h after installation (Power)']])),
-        card('Escalation matrix', ui.timeline([{ when: 'SLA breach', title: 'L1 · Sales Executive', color: 'var(--info)' }, { when: '+6 h', title: 'L2 · Sales Coordinator', color: 'var(--warn)' }, { when: '+12 h', title: 'L3 · Sales Head (Sales Manager)', color: 'var(--chart-3)' }, { when: '+48 h', title: 'L4 · Management (GM)', color: 'var(--bad)' }])),
+        card('Escalation matrix', ui.timeline([{ when: 'SLA breach', title: 'L1 · Sales Executive', color: 'var(--chart-5)' }, { when: '+6 h', title: 'L2 · Sales Coordinator', color: 'var(--warn)' }, { when: '+12 h', title: 'L3 · Sales Head (Sales Manager)', color: 'var(--chart-3)' }, { when: '+48 h', title: 'L4 · Management (GM)', color: 'var(--bad)' }])),
       ]),
     ]));
   }
@@ -2012,7 +2018,7 @@
       const closed = enq.filter((e) => !OPEN.includes(e.stage));
       host.appendChild(ui.kpis([
         { label: 'Total enquiries', value: enq.length, meta: 'Conversion ' + util.pct(closed.filter((e) => e.stage === 'Order Won').length, closed.length) + '%', onClick: () => CRM.go('enquiries') },
-        { label: 'Pipeline value', value: fmt.lakh(sum(open, 'expectedValue')), meta: open.length + ' open opportunities', color: 'var(--info)', onClick: () => CRM.go('pipeline') },
+        { label: 'Pipeline value', value: fmt.lakh(sum(open, 'expectedValue')), meta: open.length + ' open opportunities', color: 'var(--chart-5)', onClick: () => CRM.go('pipeline') },
         { label: 'Orders won', value: fmt.lakh(sum(ords, 'value')), meta: ords.length + ' orders', color: 'var(--ok)', onClick: () => CRM.go('orders') },
         { label: 'Payment collection', value: fmt.lakh(sum(coll, 'value')), meta: util.pct(coll.filter((p) => p.onTime).length, coll.length) + '% as per policy', color: 'var(--chart-2)', onClick: () => CRM.go('payments') },
         { label: 'Outstanding payments', value: fmt.lakh(sum(os, outstandingOf)), meta: fmt.lakh(sum(os.filter((i) => invStatus(i) === 'Overdue'), outstandingOf)) + ' overdue', color: 'var(--bad)', onClick: () => CRM.go('outstanding') },
@@ -2070,12 +2076,12 @@
     const fus = db.all('followups').filter((f) => f.status === 'Planned');
     el.appendChild(ui.hero(CRM.role(), ['Lead assignment', 'Sales OTS desk', 'Escalation L2', b.length + ' open SLA violations']));
     el.appendChild(ui.kpis([
-      { label: 'Awaiting assignment', value: unassigned.length + pendingOts().length, meta: pendingOts().length + ' Sales OTS', color: 'var(--violet)', onClick: () => CRM.go('enquiries') },
+      { label: 'Awaiting assignment', value: unassigned.length + pendingOts().length, meta: pendingOts().length + ' Sales OTS', color: 'var(--chart-4)', onClick: () => CRM.go('enquiries') },
       { label: 'Quotation delays', value: b.filter((x) => x.type === 'Quotation Delay').length, meta: '> 24 h without quote', color: 'var(--bad)', onClick: () => CRM.go('salespolicy') },
       { label: 'Site visit delays', value: b.filter((x) => x.type === 'Site Visit Delay').length, color: 'var(--warn)', onClick: () => CRM.go('salespolicy') },
       { label: 'Customer approved, SO pending', value: b.filter((x) => x.type === 'Customer Approval Pending SO').length, color: 'var(--chart-3)', onClick: () => CRM.go('salespolicy') },
       { label: 'Team missed follow-ups', value: fus.filter((f) => f.dueDate < todayIso()).length, color: 'var(--bad)', onClick: () => CRM.go('followups') },
-      { label: 'Quotes with manager', value: db.find('quotations', (q) => q.approval === 'Awaiting Approval').length, color: 'var(--info)', onClick: () => CRM.go('quotations') },
+      { label: 'Quotes with manager', value: db.find('quotations', (q) => q.approval === 'Awaiting Approval').length, color: 'var(--chart-5)', onClick: () => CRM.go('quotations') },
     ]));
     el.appendChild(h('div', { class: 'grid g3' }, [
       h('div', { class: 'span2' }, card('Assignment queue', ui.table({ rows: unassigned, search: false, empty: 'All leads assigned', columns: [{ key: 'id', label: 'Enquiry', render: (e) => lnk('enquiries', e.id) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (e) => ui.divTag(e.division) }, { key: 'area', label: 'Area' }, { key: 'salesChannel', label: 'Source' }, { key: 's', label: 'Suggested', render: (e) => (autoAssign(e.division, e.area).exec || {}).name }], actions: (e) => [ui.btn('Auto-assign', () => { const a = autoAssign(e.division, e.area); assignEnquiry(e, a.exec.id, a.rule); ui.toast('Assigned to ' + a.exec.name, 'ok'); CRM.refresh(); }, 'sm primary'), ui.btn('Choose', () => reassignModal(e), 'sm')] }), { flush: true, actions: [ui.btn('Assignment desk', () => CRM.go('enquiries'), 'sm')] })),
@@ -2094,7 +2100,7 @@
     const qr = db.all('quotations').filter((q) => q.quoteDate && monthKey(q.quoteDate) === mk).map(quoteResponseHrs);
     el.appendChild(ui.hero(CRM.role(), [qAw.length + oAw.length + ' approvals pending', fmt.pct(util.pct(monthWon, tg.revenue)) + ' of month target', policyBreaches().length + ' SLA violations']));
     el.appendChild(ui.kpis([
-      { label: 'Pipeline value', value: fmt.lakh(s.pipelineValue), color: 'var(--info)', onClick: () => CRM.go('pipeline') },
+      { label: 'Pipeline value', value: fmt.lakh(s.pipelineValue), color: 'var(--chart-5)', onClick: () => CRM.go('pipeline') },
       { label: 'Won this month', value: fmt.lakh(monthWon), meta: 'Target ' + fmt.lakh(tg.revenue), tone: monthWon >= tg.revenue ? 'up' : 'down', color: 'var(--ok)', onClick: () => CRM.go('targets') },
       { label: 'Approvals pending', value: qAw.length + oAw.length, meta: qAw.length + ' quotes · ' + oAw.length + ' SOs', color: 'var(--warn)' },
       { label: 'Conversion rate', value: fmt.pct(util.pct(closed.filter((e) => e.stage === 'Order Won').length, closed.length)) },
@@ -2123,7 +2129,7 @@
       { label: 'Overdue', value: fmt.lakh(sum(os.filter((i) => invStatus(i) === 'Overdue'), outstandingOf)), color: 'var(--bad)', onClick: () => CRM.go('outstanding') },
       { label: 'Due today', value: fmt.lakh(sum(os.filter((i) => util.iso(i.dueDate) === t), outstandingOf)), color: 'var(--warn)' },
       { label: 'Collected this month', value: fmt.lakh(sum(db.all('payments').filter((p) => monthKey(p.receivedDate) === mk), 'value')), color: 'var(--ok)', onClick: () => CRM.go('payments') },
-      { label: 'Field payments to verify', value: db.find('payments', (p) => !p.verified).length, color: 'var(--violet)', onClick: () => CRM.go('payments') },
+      { label: 'Field payments to verify', value: db.find('payments', (p) => !p.verified).length, color: 'var(--chart-4)', onClick: () => CRM.go('payments') },
     ]));
     el.appendChild(h('div', { class: 'grid g3' }, [
       h('div', { class: 'span2' }, card('Payments to collect (overdue, today & next 3 days)', invoiceTable(due, { search: false, pageSize: 8 }), { flush: true })),

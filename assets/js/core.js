@@ -33,7 +33,8 @@
 
   const fmt = {
     date: (d) => { if (!d) return '—'; const x = new Date(d); return isNaN(x) ? '—' : x.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }); },
-    dateTime: (d) => { if (!d) return '—'; const x = new Date(d); return isNaN(x) ? '—' : x.toLocaleString('en-IN', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }); },
+    // Brand book writing mechanics: "25 Oct 2026 · 10:30 AM"
+    dateTime: (d) => { if (!d) return '—'; const x = new Date(d); if (isNaN(x)) return '—'; return fmt.date(x) + ' · ' + x.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }); },
     money: (n) => '₹' + Math.round(Number(n) || 0).toLocaleString('en-IN'),
     lakh: (n) => { n = Number(n) || 0; if (Math.abs(n) >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr'; if (Math.abs(n) >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L'; return fmt.money(n); },
     num: (n) => (Number(n) || 0).toLocaleString('en-IN'),
@@ -49,25 +50,25 @@
   // ---------------------------------------------------------------- roles
   // Roles consolidated from the Sales, Electronic Security, Solar and Service requirement documents.
   const ROLES = [
-    { id: 'admin', name: 'CRM Administrator', group: 'Management', user: 'Karthik R', color: '#475569' },
-    { id: 'gm', name: 'GM / CEO', group: 'Management', user: 'S. Maruthi', color: '#0f172a' },
-    { id: 'odm', name: 'ODM (Operations)', group: 'Management', user: 'Lakshmi N', color: '#7c4ddb' },
-    { id: 'sales_manager', name: 'Sales Manager', group: 'Sales', user: 'Ramesh K', color: '#3b5bdb' },
-    { id: 'sales_coordinator', name: 'Sales Coordinator', group: 'Sales', user: 'Divya S', color: '#4c6ef5' },
-    { id: 'sales_exec', name: 'Sales Executive', group: 'Sales', user: 'Arun Kumar', color: '#5c7cfa' },
-    { id: 'accounts', name: 'Accounts Team', group: 'Finance', user: 'Meena P', color: '#0b7285' },
-    { id: 'es_coordinator', name: 'Electronic Security Coordinator', group: 'Projects', user: 'Vignesh M', color: '#3b5bdb' },
-    { id: 'solar_coordinator', name: 'Solar Coordinator', group: 'Projects', user: 'Prakash V', color: '#12a150' },
-    { id: 'doc_coordinator', name: 'Documentation Coordinator', group: 'Projects', user: 'Kavya R', color: '#2b8a3e' },
-    { id: 'tech_engineer', name: 'Technical Engineer', group: 'Projects', user: 'Suresh B', color: '#1971c2' },
-    { id: 'tech_head', name: 'Technical Head', group: 'Projects', user: 'Balaji T', color: '#1864ab' },
-    { id: 'purchase', name: 'Purchase Coordinator', group: 'Supply Chain', user: 'Gopi K', color: '#e8890c' },
-    { id: 'stores', name: 'Stores / Logistics', group: 'Supply Chain', user: 'Murugan S', color: '#d9480f' },
-    { id: 'install_lead', name: 'Installation Team Leader', group: 'Projects', user: 'Senthil A', color: '#5f3dc4' },
-    { id: 'vendor', name: 'External Vendor', group: 'External', user: 'Sri Sai Electricals', color: '#868e96' },
-    { id: 'service_coordinator', name: 'Service Coordinator', group: 'Service', user: 'Priya D', color: '#c2255c' },
-    { id: 'service_engineer', name: 'Service Engineer', group: 'Service', user: 'Manoj V', color: '#e64980' },
-    { id: 'pm_coordinator', name: 'PM / AMC Coordinator', group: 'Service', user: 'Anitha J', color: '#a61e4d' },
+    { id: 'admin', name: 'CRM Administrator', group: 'Management', user: 'Karthik R', color: '#5C6066' },
+    { id: 'gm', name: 'GM / CEO', group: 'Management', user: 'S. Maruthi', color: '#0A0A0A' },
+    { id: 'odm', name: 'ODM (Operations)', group: 'Management', user: 'Lakshmi N', color: '#2B2B2B' },
+    { id: 'sales_manager', name: 'Sales Manager', group: 'Sales', user: 'Ramesh K', color: '#EC000A' },
+    { id: 'sales_coordinator', name: 'Sales Coordinator', group: 'Sales', user: 'Divya S', color: '#B80008' },
+    { id: 'sales_exec', name: 'Sales Executive', group: 'Sales', user: 'Arun Kumar', color: '#EC000A' },
+    { id: 'accounts', name: 'Accounts Team', group: 'Finance', user: 'Meena P', color: '#2B2B2B' },
+    { id: 'es_coordinator', name: 'Electronic Security Coordinator', group: 'Projects', user: 'Vignesh M', color: '#0A0A0A' },
+    { id: 'solar_coordinator', name: 'Solar Coordinator', group: 'Projects', user: 'Prakash V', color: '#137333' },
+    { id: 'doc_coordinator', name: 'Documentation Coordinator', group: 'Projects', user: 'Kavya R', color: '#137333' },
+    { id: 'tech_engineer', name: 'Technical Engineer', group: 'Projects', user: 'Suresh B', color: '#2B2B2B' },
+    { id: 'tech_head', name: 'Technical Head', group: 'Projects', user: 'Balaji T', color: '#0A0A0A' },
+    { id: 'purchase', name: 'Purchase Coordinator', group: 'Supply Chain', user: 'Gopi K', color: '#5C6066' },
+    { id: 'stores', name: 'Stores / Logistics', group: 'Supply Chain', user: 'Murugan S', color: '#5C6066' },
+    { id: 'install_lead', name: 'Installation Team Leader', group: 'Projects', user: 'Senthil A', color: '#2B2B2B' },
+    { id: 'vendor', name: 'External Vendor', group: 'External', user: 'Sri Sai Electricals', color: '#5C6066' },
+    { id: 'service_coordinator', name: 'Service Coordinator', group: 'Service', user: 'Priya D', color: '#B80008' },
+    { id: 'service_engineer', name: 'Service Engineer', group: 'Service', user: 'Manoj V', color: '#EC000A' },
+    { id: 'pm_coordinator', name: 'PM / AMC Coordinator', group: 'Service', user: 'Anitha J', color: '#B80008' },
   ];
   const ROLE_GROUPS = ['Management', 'Sales', 'Finance', 'Projects', 'Supply Chain', 'Service', 'External'];
   const ALL = ROLES.map((r) => r.id);
@@ -160,9 +161,9 @@
 
   const PRODUCT_CATALOG = [
     // Power
-    ['Power', 'Inverter', 'MPCS Inverter 900VA', 7800], ['Power', 'Inverter', 'MPCS Inverter 1.5KVA', 11500], ['Power', 'Inverter', 'MPCS Inverter 3KVA', 24500], ['Power', 'Inverter', 'MPCS Inverter 5KVA', 41000],
-    ['Power', 'Online UPS', 'MPCS Online UPS 1KVA', 18500], ['Power', 'Online UPS', 'MPCS Online UPS 3KVA', 42000], ['Power', 'Online UPS', 'MPCS Online UPS 10KVA', 135000], ['Power', 'Online UPS', 'MPCS Online UPS 20KVA', 245000], ['Power', 'Online UPS', 'MPCS Online UPS 60KVA', 690000],
-    ['Power', 'Servo Stabilizer', 'MPCS Servo Stabilizer 10KVA', 38000], ['Power', 'Servo Stabilizer', 'MPCS Servo Stabilizer 50KVA', 145000], ['Power', 'Servo Stabilizer', 'MPCS Servo Stabilizer 200KVA', 465000],
+    ['Power', 'Inverter', 'Maruthi Inverter 900VA', 7800], ['Power', 'Inverter', 'Maruthi Inverter 1.5KVA', 11500], ['Power', 'Inverter', 'Maruthi Inverter 3KVA', 24500], ['Power', 'Inverter', 'Maruthi Inverter 5KVA', 41000],
+    ['Power', 'Online UPS', 'Maruthi Online UPS 1KVA', 18500], ['Power', 'Online UPS', 'Maruthi Online UPS 3KVA', 42000], ['Power', 'Online UPS', 'Maruthi Online UPS 10KVA', 135000], ['Power', 'Online UPS', 'Maruthi Online UPS 20KVA', 245000], ['Power', 'Online UPS', 'Maruthi Online UPS 60KVA', 690000],
+    ['Power', 'Servo Stabilizer', 'Maruthi Servo Stabilizer 10KVA', 38000], ['Power', 'Servo Stabilizer', 'Maruthi Servo Stabilizer 50KVA', 145000], ['Power', 'Servo Stabilizer', 'Maruthi Servo Stabilizer 200KVA', 465000],
     ['Power', 'Battery', 'Exide 150Ah Tubular', 15500], ['Power', 'Battery', 'SF Sonic 100Ah', 10200], ['Power', 'Battery', 'Exide SMF 26Ah', 4800],
     // Electronic Security
     ['Electronic Security', 'CCTV', 'IP Dome Camera 4MP', 4200], ['Electronic Security', 'CCTV', 'IP Bullet Camera 4MP', 4600], ['Electronic Security', 'CCTV', 'PTZ Camera 2MP 25x', 38000], ['Electronic Security', 'CCTV', 'NVR 16 Channel', 14500], ['Electronic Security', 'CCTV', 'NVR 32 Channel', 26000], ['Electronic Security', 'CCTV', 'PoE Switch 16 Port', 11800], ['Electronic Security', 'CCTV', 'Surveillance HDD 4TB', 9200],
@@ -281,7 +282,7 @@
         contentEl.innerHTML = '<div class="empty"><div class="big">🔒</div><h2>Access restricted</h2><p>The <b>' + util.esc(role().name) + '</b> role cannot open <b>' + util.esc(p.title) + '</b>.<br>Access follows role and assignment as defined in the requirement documents.</p><a class="btn primary" href="#/home">Back to my dashboard</a></div>';
         return;
       }
-      document.title = p.title + ' · MPCS CRM';
+      document.title = p.title + ' · Maruthi CRM';
       p.render(contentEl, params);
     } catch (e) {
       console.error(e);
@@ -294,16 +295,81 @@
     const vis = visiblePages().sort((a, b) => (a.order || 50) - (b.order || 50));
     const sections = [];
     vis.forEach((p) => { const s = p.section || 'General'; if (!sections.includes(s)) sections.push(s); });
-    let html = '<a href="#/home" class="' + (activeId === 'home' ? 'active' : '') + '"><span class="ico">◧</span>My Dashboard</a>';
+    let html = '<a href="#/home" class="' + (activeId === 'home' ? 'active' : '') + '"><span class="ico">' + ICONS.grid + '</span>My Dashboard</a>';
     sections.forEach((s) => {
       html += '<div class="nav-section">' + util.esc(s) + '</div>';
       vis.filter((p) => (p.section || 'General') === s).forEach((p) => {
         let count = '';
         try { const c = p.badge ? p.badge() : 0; if (c) count = '<span class="count">' + c + '</span>'; } catch (e) { /* ignore */ }
-        html += '<a href="#/' + p.id + '" class="' + (p.id === activeId ? 'active' : '') + '"><span class="ico">' + (p.icon || '•') + '</span>' + util.esc(p.title) + count + '</a>';
+        html += '<a href="#/' + p.id + '" class="' + (p.id === activeId ? 'active' : '') + '"><span class="ico">' + navIcon(p) + '</span>' + util.esc(p.title) + count + '</a>';
       });
     });
     navEl.innerHTML = html;
+  }
+
+  // Brand book icon style: outline, 2px stroke, rounded joins, red accent stroke on the "power" element.
+  const svg = (body) => '<svg viewBox="0 0 24 24" aria-hidden="true">' + body + '</svg>';
+  const ICONS = {
+    grid: svg('<rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect class="acc" x="3" y="16" width="7" height="5"/>'),
+    phone: svg('<rect x="7" y="2" width="10" height="20" rx="2"/><path class="acc" d="M11 18h2"/>'),
+    inbox: svg('<path d="M3 13l3-8h12l3 8v6H3z"/><path class="acc" d="M3 13h5l1 3h6l1-3h5"/>'),
+    kanban: svg('<rect x="3" y="4" width="5" height="16"/><rect x="10" y="4" width="5" height="11"/><rect class="acc" x="17" y="4" width="4" height="7"/>'),
+    doc: svg('<path d="M6 2h9l4 4v16H6z"/><path d="M14 2v5h5"/><path class="acc" d="M9 13h7M9 17h5"/>'),
+    box: svg('<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4M12 11v10"/><path class="acc" d="M7.5 5l9 4"/>'),
+    calendar: svg('<rect x="3" y="5" width="18" height="16" rx="1"/><path d="M3 10h18M8 3v4M16 3v4"/><path class="acc" d="M9 15l2 2 4-4"/>'),
+    call: svg('<path d="M5 4h4l2 5-3 2a11 11 0 006 6l2-3 5 2v4a2 2 0 01-2 2A17 17 0 013 6a2 2 0 012-2"/><path class="acc" d="M15 3a6 6 0 016 6"/>'),
+    trend: svg('<path d="M3 17l6-6 4 4 8-8"/><path class="acc" d="M15 7h6v6"/>'),
+    users: svg('<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0113 0"/><path class="acc" d="M16 4.5a3.5 3.5 0 010 7M18 14a6 6 0 013.5 6"/>'),
+    target: svg('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle class="acc" cx="12" cy="12" r="1.5"/>'),
+    upload: svg('<path d="M4 15v5h16v-5"/><path class="acc" d="M12 16V4M7 9l5-5 5 5"/>'),
+    receipt: svg('<path d="M5 2h14v20l-3-2-2 2-2-2-2 2-2-2-3 2z"/><path class="acc" d="M9 8h6M9 12h6M9 16h4"/>'),
+    rupee: svg('<path d="M6 4h12M6 9h12"/><path class="acc" d="M9 4c5 0 5 9 0 9H7l8 8"/>'),
+    hourglass: svg('<path d="M6 2h12M6 22h12M7 2c0 6 10 8 10 20M17 2c0 6-10 8-10 20"/><path class="acc" d="M9 19h6"/>'),
+    chart: svg('<path d="M3 21h18"/><rect x="5" y="11" width="3" height="7"/><rect x="10.5" y="6" width="3" height="12"/><rect class="acc" x="16" y="3" width="3" height="15"/>'),
+    clock: svg('<circle cx="12" cy="12" r="9"/><path class="acc" d="M12 7v5l3 2"/>'),
+    alert: svg('<path d="M12 3l10 18H2z"/><path class="acc" d="M12 10v5M12 18v.5"/>'),
+    building: svg('<path d="M4 21V5l8-3v19M12 8l8 3v10M2 21h20"/><path class="acc" d="M7 9v.5M7 13v.5M16 14v.5"/>'),
+    pin: svg('<path d="M12 22s7-7 7-12a7 7 0 00-14 0c0 5 7 12 7 12z"/><circle class="acc" cx="12" cy="10" r="2.5"/>'),
+    list: svg('<path d="M9 6h12M9 12h12M9 18h12"/><path class="acc" d="M4 6h.5M4 12h.5M4 18h.5"/>'),
+    check: svg('<rect x="3" y="3" width="18" height="18" rx="2"/><path class="acc" d="M8 12l3 3 5-6"/>'),
+    lock: svg('<rect x="4" y="11" width="16" height="10" rx="1"/><path d="M8 11V7a4 4 0 018 0v4"/><path class="acc" d="M12 15v2"/>'),
+    shield: svg('<path d="M12 2l8 3v7c0 5-3.5 8.5-8 10-4.5-1.5-8-5-8-10V5z"/><path class="acc" d="M8.5 12l2.5 2.5 4.5-5"/>'),
+    handshake: svg('<path d="M2 12l4-4 4 2 3-2 5 1 4 3"/><path d="M6 8v6l5 4 3-2 4-3"/><path class="acc" d="M11 12l3 3"/>'),
+    scale: svg('<path d="M12 3v18M5 21h14M4 7h16"/><path d="M4 7l-2 6a3 3 0 006 0zM20 7l-2 6a3 3 0 006 0z"/><path class="acc" d="M12 3v2"/>'),
+    warehouse: svg('<path d="M2 9l10-6 10 6v12H2z"/><path d="M6 21v-8h12v8"/><path class="acc" d="M6 17h12"/>'),
+    cart: svg('<path d="M2 3h3l3 12h11l2-8H6"/><circle cx="9" cy="20" r="1.5"/><circle class="acc" cx="17" cy="20" r="1.5"/>'),
+    truck: svg('<path d="M2 6h12v10H2zM14 10h4l3 3v3h-7"/><circle cx="6" cy="18" r="2"/><circle class="acc" cx="17" cy="18" r="2"/>'),
+    recycle: svg('<path d="M7 19H4l3-5M17 19h3l-3-5M9 5l3-3 3 5"/><path class="acc" d="M7 19h10M6 13l3-6M18 13l-3-6"/>'),
+    gauge: svg('<path d="M3 16a9 9 0 0118 0"/><path class="acc" d="M12 16l4-5"/><path d="M3 20h18"/>'),
+    sun: svg('<path d="M3 21l3-9h12l3 9z"/><path d="M5 16.5h14M12 12v9"/><circle class="acc" cx="12" cy="5" r="2.5"/>'),
+    wrench: svg('<path d="M14.7 6.3a4 4 0 00-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 005.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/><path class="acc" d="M19 19l2 2"/>'),
+    gear: svg('<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/><circle class="acc" cx="12" cy="12" r=".5"/>'),
+    server: svg('<rect x="3" y="4" width="18" height="7" rx="1"/><rect x="3" y="13" width="18" height="7" rx="1"/><path class="acc" d="M7 7.5h.5M7 16.5h.5"/>'),
+    bolt: svg('<rect x="3" y="7" width="18" height="12" rx="1"/><path d="M7 7V5M17 7V5"/><path class="acc" d="M13 9l-3 4h4l-3 4"/>'),
+    award: svg('<circle cx="12" cy="9" r="6"/><path d="M8.5 14L7 22l5-3 5 3-1.5-8"/><path class="acc" d="M10 9l1.5 1.5L14 8"/>'),
+    user: svg('<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0116 0"/><path class="acc" d="M12 12v2"/>'),
+    database: svg('<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path class="acc" d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>'),
+    scroll: svg('<path d="M6 3h11a2 2 0 012 2v14a2 2 0 01-2 2H7a2 2 0 01-2-2V7H3V5a2 2 0 012-2"/><path class="acc" d="M9 9h6M9 13h6M9 17h3"/>'),
+    compass: svg('<circle cx="12" cy="12" r="9"/><path class="acc" d="M15.5 8.5l-2 5-5 2 2-5z"/>'),
+    message: svg('<path d="M4 4h16v12H9l-5 4z"/><path class="acc" d="M8 9h8M8 12h5"/>'),
+    dot: svg('<circle class="acc" cx="12" cy="12" r="3"/>'),
+  };
+  // Order matters: the first matching rule wins.
+  const ICON_RULES = [
+    [/role design|guide/, 'compass'], [/mobile/, 'phone'], [/vault|device schedule|credential/, 'lock'], [/pending tasks/, 'check'], [/my assigned/, 'check'],
+    [/dashboard|cockpit|execution$/, 'grid'], [/lead|enquir/, 'inbox'], [/pipeline/, 'kanban'], [/quotation/, 'doc'], [/sales order/, 'box'],
+    [/follow-up|follow up/, 'calendar'], [/compliance follow/, 'calendar'], [/calls|cold/, 'call'], [/ots/, 'call'], [/upsell|cross/, 'trend'], [/dealer|vendor/, 'users'],
+    [/target|kpi/, 'target'], [/migration|import/, 'upload'], [/billing|invoice/, 'receipt'], [/payment|collection|subsidy/, 'rupee'], [/outstanding|ageing/, 'hourglass'],
+    [/cycle/, 'clock'], [/violation|escalation|sla/, 'alert'], [/report/, 'chart'], [/project material/, 'box'], [/project|installation/, 'building'], [/survey/, 'pin'], [/boq/, 'list'],
+    [/inspection|rework|quality/, 'shield'], [/handover/, 'handshake'], [/policy|rules|compliance/, 'scale'], [/stock|grn|inward/, 'warehouse'], [/purchase/, 'cart'],
+    [/challan|delivery|material issue/, 'truck'], [/scrap/, 'recycle'], [/net meter/, 'gauge'], [/solar/, 'sun'], [/complaint/, 'wrench'], [/spare|standby/, 'bolt'],
+    [/equipment|register|asset/, 'server'], [/amc|warranty/, 'shield'], [/preventive|^pm /, 'calendar'], [/performance/, 'award'], [/config|settings/, 'gear'],
+    [/customer/, 'user'], [/users|access/, 'users'], [/master/, 'database'], [/audit/, 'scroll'], [/feedback/, 'message'], [/task/, 'check'],
+  ];
+  function navIcon(p) {
+    const t = (p.title + ' ' + p.id).toLowerCase();
+    const r = ICON_RULES.find(([re]) => re.test(t));
+    return ICONS[r ? r[1] : 'dot'];
   }
 
   function genericHome(el) {
@@ -312,7 +378,7 @@
     el.appendChild(ui.hero(r));
     const list = visiblePages();
     const grid = h('div', { class: 'grid g3' });
-    list.forEach((p) => grid.appendChild(h('a', { class: 'card card-body', href: '#/' + p.id }, [h('div', { style: 'font-size:22px' }, p.icon || '•'), h('h3', {}, p.title), h('div', { class: 'muted small' }, p.section || '')])));
+    list.forEach((p) => grid.appendChild(h('a', { class: 'card card-body', href: '#/' + p.id }, [h('div', { class: 'ico', style: 'margin-bottom:6px', html: navIcon(p) }), h('h3', {}, p.title), h('div', { class: 'muted small' }, p.section || '')])));
     el.appendChild(grid);
   }
 
@@ -355,6 +421,7 @@
         h('div', {}, [crumbs ? h('div', { class: 'crumbs' }, crumbs) : null, h('h1', {}, title), sub ? h('div', { class: 'sub' }, sub) : null]),
         h('div', { class: 'page-actions' }, actions || []),
       ]);
+      el.appendChild(h('div', { class: 'brand-strip' }, [h('img', { src: 'assets/brand/logo-primary.png', alt: 'Maruthi Power Control Systems' }), h('span', { class: 'small muted' }, fmt.date(new Date()))]));
       el.appendChild(head);
       return head;
     },
@@ -565,7 +632,7 @@
       const prog = h('div', { class: 'progress', style: 'margin-bottom:8px' }, h('i'));
       const lbl = h('div', { class: 'small muted', style: 'margin-bottom:4px' });
       const list = h('div', { class: 'checklist' });
-      function upd() { const done = items.filter((i) => stateObj[i]).length; prog.firstChild.style.width = util.pct(done, items.length) + '%'; prog.style.setProperty('--pc', done === items.length ? 'var(--ok)' : 'var(--brand)'); lbl.textContent = done + ' of ' + items.length + ' checks complete'; }
+      function upd() { const done = items.filter((i) => stateObj[i]).length; prog.firstChild.style.width = util.pct(done, items.length) + '%'; prog.style.setProperty('--pc', done === items.length ? 'var(--ok)' : 'var(--chart-1)'); lbl.textContent = done + ' of ' + items.length + ' checks complete'; }
       items.forEach((it) => {
         const cb = h('input', { type: 'checkbox', checked: stateObj[it] ? true : null, disabled: readOnly ? true : null });
         const l = h('label', { class: stateObj[it] ? 'done' : '' }, [cb, h('span', {}, it)]);
@@ -577,7 +644,7 @@
       wrap.complete = () => items.every((i) => stateObj[i]);
       return wrap;
     },
-    progress(pct, color) { return h('div', { class: 'progress', style: '--pc:' + (color || (pct >= 100 ? 'var(--ok)' : pct >= 60 ? 'var(--brand)' : 'var(--warn)')) }, h('i', { style: 'width:' + Math.min(100, Math.max(0, pct)) + '%' })); },
+    progress(pct, color) { return h('div', { class: 'progress', style: '--pc:' + (color || (pct >= 100 ? 'var(--ok)' : pct >= 60 ? 'var(--chart-1)' : 'var(--chart-4)')) }, h('i', { style: 'width:' + Math.min(100, Math.max(0, pct)) + '%' })); },
     timeline(items) {
       // items: [{when, title, body, color}]
       return h('div', { class: 'timeline' }, items.map((i) => h('div', { class: 'tl-item' }, [h('div', { class: 'tl-dot', style: i.color ? 'background:' + i.color : null }), h('div', {}, [h('div', { class: 'when' }, i.when), h('div', { style: 'font-weight:600' }, i.title), i.body ? h('div', { class: 'small muted' }, i.body) : null])])));
@@ -650,7 +717,7 @@
       const max = Math.max(1, ...rows.map((r) => Math.max(r.value, r.target || 0)));
       return h('div', { class: 'hbar' }, rows.flatMap((r) => {
         const pct = r.target ? util.pct(r.value, r.target) : null;
-        const color = r.color || (pct == null ? 'var(--brand)' : pct >= 100 ? 'var(--ok)' : pct >= 70 ? 'var(--brand)' : pct >= 40 ? 'var(--warn)' : 'var(--bad)');
+        const color = r.color || (pct == null ? 'var(--chart-1)' : pct >= 100 ? 'var(--ok)' : pct >= 70 ? 'var(--chart-1)' : pct >= 40 ? 'var(--chart-4)' : 'var(--bad)');
         return [
           h('div', { class: 'small', style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.label),
           h('div', { class: 'bar', title: r.target ? 'Target ' + r.target : '' }, h('i', { style: 'width:' + (r.value / max * 100) + '%;background:' + color })),
@@ -708,17 +775,19 @@
     const r = role();
     const app = h('div', { class: 'app' }, [
       h('aside', { class: 'sidebar' }, [
-        h('div', { class: 'brand' }, [h('div', { class: 'brand-logo' }, 'M'), h('div', {}, [h('div', { class: 'brand-name' }, 'Maruthi Power'), h('div', { class: 'brand-sub' }, 'Unified CRM · Since 1996')])]),
+        h('a', { class: 'brand', href: '#/home', 'aria-label': 'Maruthi Power Control Systems — home' }, [h('img', { src: 'assets/brand/logo-reversed.png', alt: 'Maruthi Power Control Systems', width: 200, height: 36 }), h('div', { class: 'brand-sub' }, 'Unified CRM · Since 1996')]),
+        h('div', { class: 'speed-bands', 'aria-hidden': 'true' }),
         navEl = h('nav', { class: 'nav' }),
-        h('div', { class: 'side-foot' }, [h('div', {}, 'Power · Electronic Security · Solar'), h('a', { href: '#/', style: 'color:var(--side-text)', onClick: (e) => { e.preventDefault(); ui.confirm('Reset demo data', 'This clears all local CRM data and regenerates the sample dataset. Continue?', () => db.reset()); } }, '↺ Reset demo data')]),
+        h('div', { class: 'side-foot' }, [h('div', { class: 'tagline' }, 'Power that stays on.'), h('div', { class: 'tagline-ta', lang: 'ta' }, 'தடையில்லா மின்சாரம், தளராத நம்பிக்கை.'), h('div', {}, 'Power · Electronic Security · Solar'), h('a', { href: '#/', style: 'color:var(--side-text)', onClick: (e) => { e.preventDefault(); ui.confirm('Reset demo data', 'This clears all local CRM data and regenerates the sample dataset. Continue?', () => db.reset()); } }, '↺ Reset demo data')]),
       ]),
       h('div', { class: 'main' }, [
         h('header', { class: 'topbar' }, [
-          h('button', { class: 'icon-btn menu-btn', 'aria-label': 'Menu', onClick: () => app.classList.toggle('nav-open') }, '☰'),
+          h('button', { class: 'icon-btn menu-btn ico', 'aria-label': 'Menu', onClick: () => app.classList.toggle('nav-open'), html: svg('<path d="M4 7h16M4 12h16"/><path class="acc" d="M4 17h10"/>') }),
+          h('img', { class: 'top-logo', src: 'assets/brand/logo-compact.png', alt: 'Maruthi' }),
           h('div', { class: 'search' }, [h('input', { type: 'search', placeholder: 'Search customers, enquiries, projects, complaints…', onInput: util.debounce((e) => doSearch(e.target.value), 180), onBlur: () => setTimeout(() => document.getElementById('searchResults').classList.add('hidden'), 200) }), h('div', { id: 'searchResults', class: 'search-results hidden' })]),
           h('div', { class: 'top-spacer' }),
-          h('button', { class: 'icon-btn', title: 'Toggle theme', onClick: toggleTheme }, '◐'),
-          h('div', { id: 'bellWrap', style: 'position:relative' }, [h('button', { class: 'icon-btn', title: 'Notifications', onClick: toggleNotifPanel }, ['🔔', h('span', { id: 'bellDot', class: 'dot hidden' }, '0')])]),
+          h('button', { class: 'icon-btn ico theme-btn', title: 'Toggle theme', 'aria-label': 'Toggle theme', onClick: toggleTheme, html: svg('<circle cx="12" cy="12" r="8"/><path class="acc" d="M12 4a8 8 0 010 16z"/>') }),
+          h('div', { id: 'bellWrap', style: 'position:relative' }, [h('button', { class: 'icon-btn ico', title: 'Notifications', 'aria-label': 'Notifications', onClick: toggleNotifPanel }, [h('span', { style: 'display:grid', html: svg('<path d="M6 16V11a6 6 0 0112 0v5l2 2H4z"/><path class="acc" d="M10 20a2 2 0 004 0"/>') }), h('span', { id: 'bellDot', class: 'dot hidden' }, '0')])]),
           h('label', { class: 'role-switch', title: 'Switch role to preview each user experience' }, [h('span', { class: 'avatar', id: 'roleAvatar', style: 'background:' + r.color }, util.initials(r.user)), roleSel]),
         ]),
         contentEl = h('main', { class: 'content', id: 'content' }),
@@ -864,7 +933,7 @@
     db, util, fmt, ui, h, master, notify, on, emit, go, refresh,
     roles: ROLES, ROLE: Object.fromEntries(ROLES.map((r) => [r.id, r.id])), ALL, MGMT, role, user, is, canSee,
     registerPage, registerHome, registerSeed, registerRole, registerSearch, registerCustomerSection,
-    nextId, TODAY, persist,
+    nextId, TODAY, persist, icons: ICONS,
   };
   document.addEventListener('DOMContentLoaded', boot);
 })();
