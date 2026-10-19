@@ -44,7 +44,7 @@ This is a dependency-free, browser-only build, so it does not connect to any ext
 
 | Integration | What happens today | Hook |
 |---|---|---|
-| WhatsApp Business API | Messages (bilingual English + Tamil, signed "Team Maruthi") are composed and recorded on the notification as "WhatsApp (simulated)". Nothing is sent. | Settings & Rules → Notification channels (per event type, stored as `notify.channels`). The `notifications:created` event carries the channel list. |
+| WhatsApp Business API | Messages (bilingual English + Tamil, signed "Team Maruthi") are composed and recorded on the notification as "WhatsApp (simulated)". Nothing is sent. | Settings & Rules → Notification channels (per event type, stored as `channels.<event>`). The `notifications:created` event carries the resolved `channel`, and service emits `customer.message` for each customer-facing SMS/WhatsApp message. |
 | E-mail | Approvals, escalations and DRM/WRM/MRM distribution are recorded as "Email (simulated)". | The same channel matrix, `exec.reportRecipients` and the `report.dispatch` event (report, period, division, recipients, KPI summary). |
 | Tally / Zoho (accounting & stock) | Invoices, payments and stock are kept in the CRM and exported to CSV. Stock balances are labelled as mirrored from Tally Prime, and reconciliation adjustments are logged. | The `invoice.raised` and `<collection>:created/updated` events, the CSV exports and Data Import (for loading masters and balances). |
 | Telephony / IVR (CUG, landline) | The complaint and lead source (CUG number, landline, phone, WhatsApp…) is recorded by hand, and call logs are entered, not captured. | The `complaints:created` and `enquiries:created` events. A CTI adapter would create the record with its `source` field. |

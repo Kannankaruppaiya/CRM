@@ -40,9 +40,10 @@ Editable list masters, maintained in **Master Data**: `master.areas`, `master.se
 ## Module-owned collections
 | Module | Collections |
 |---|---|
-| sales | `enquiries`, `quotations`, `orders`, `invoices`, `payments`, `followups`, `dealers`, `upsells`, `targets`, `callLogs`, `checkins` (+ `salesFiles` only when `CRM.files` is absent) |
+| sales | `enquiries`, `quotations`, `orders`, `invoices`, `payments`, `followups`, `dealers`, `upsells`, `targets`, `callLogs`, `checkins` (+ `salesFiles` only when `CRM.files` is absent, `salesConfig` only when `CRM.config` is absent). Sales also creates core `customers` and `sites` (a new customer captured on a lead, owned by the executive) and promotes a customer from New to Existing when its first SO is approved. |
 | projects | `projects` (ES large/small + Solar), `surveys`, `boqs`, `purchaseRequests`, `purchaseOrders`, `grns`, `stock`, `dcs`, `scrap`, `netMetering`, `subsidies`, `credVault` (references and access audit only, never secrets) |
-| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests`, `ots`, `amcOpportunities`, `serviceConfig` |
+| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests`, `ots`, `amcOpportunities`, `serviceConfig`. It inserts a `scrap` record only as a fallback, when no `scrap.create.requested` listener created one. |
+| executive | none: it reads every collection and stores only `exec.*` config keys |
 
 A module reads other modules' collections but never writes them directly. Cross-module handoffs go through the event bus instead.
 
@@ -65,7 +66,7 @@ A module reads other modules' collections but never writes them directly. Cross-
 | Event | Emitted by | Payload | Listener does |
 |---|---|---|---|
 | `order.won` | sales | `{ order, enquiry }`, where order has `id, soNumber, customerId, division, product, productId, quantity, value, quotationId?, cameraCount?, systemType?, capacityKw?` | Projects creates a project or job for Electronic Security and Solar. It **refuses** an order (and notifies the coordinator) unless the order has both `id` and `soNumber`. It never invents a camera count: a CCTV order without `cameraCount` waits in "Awaiting classification". Service creates the `assets` record, warranty and PM plan for Power, because Power orders have no installation project. |
-| `project.handover` | projects | `{ project, equipment:[{productId, name, serial, location, make, model, tag, channel, qty, capacityKw?, warrantyStart, warrantyEnd, warrantyTerms, installDate}] }` | service creates `assets`, activates warranty and PM, and notifies the PM coordinator |
+| `project.handover` | projects | `{ project, equipment:[{productId, name, type, serial, location, make, brand, model, tag, channel, qty, capacity, capacityKw?, warrantyStart, warrantyEnd, warrantyTerms, installDate}] }`. `project` carries `handoverAt`, `commissionedAt` and `commissioningReportNo`. Emitted once, when the project closes (operational or administrative closure). | service creates one `assets` record per row (make, model, camera tag and recording channel kept separate, capacity, install date, warranty start/end/terms from the row), creates the warranty PM plans and notifies the PM and service coordinators. It ignores a repeat for a project that already has assets. |
 | `invoice.raised` | sales | `{ invoice }` | — (dashboards) |
 | `complaint.chargeable` | service | `{ complaint, amount }` | sales creates the service invoice and then emits `invoice.raised` |
 | `ots.created` | service | `{ ots }` (Sales OTS: more than 2 batteries) | sales queues it on the Sales OTS desk |
@@ -73,15 +74,26 @@ A module reads other modules' collections but never writes them directly. Cross-
 | `ots.outcome` | sales | `{ otsId, enquiryId, status: 'Quotation Sent'\|'Negotiation'\|'Won'\|'Lost', revenue, orderId, quoteId, quoteValue, closedBy, by, reason, lostReason, at, reopened }` | service updates the OTS status and its quotation/order links |
 | `violation.raise` | any | `{ division, type, policyRef, owner, severity, recordId, link, details }` plus optional `warning` (boolean, a warning rather than a violation), `silent` (no notification), `at` (ISO time of the breach) and `col` (source collection). New projects types: "Configuration / testing completed without evidence", "Unauthorized device / configuration change", "Unapproved substitution of critical equipment", "Material delay against project schedule", "Vendor delay against committed schedule", "Project budget exceeded", "BOQ change implemented without approval" | service (the ODM desk) creates the `violations` record |
 | `project.installation.requested` | service | `{ complaint }`: an ES/Solar complaint with call type "Project Installation". Uses `complaint.id, division, customerId, siteId?, systemType?/productType?, cameraCount?, quantity?, capacityKw?, value?, priority?, description?, soNumber?` | projects creates one project per complaint (`project.sourceComplaintId`), with the SO number pending until it is linked in Project setup |
-| `project.installation.created` | projects | `{ projectId, complaintId }` | service links the complaint to the project |
-| `installation.updated` / `installation.completed` | service | `{ orderId, complaintId, status, installedAt/completedAt, payment {mode,status,amount,date,balance}, scrapCollected, scrapId, dcRef, invoiceRef }` | sales sets the SO `installationStatus`, `installationCompletionDate` and `scrapCollected`; warranty starts from the install date |
+| `project.installation.created` | projects | `{ projectId, complaintId }` | service sets `complaint.projectId` |
+| `installation.updated` | service | `{ orderId, complaintId, status ('Pending'\|'Assigned'\|'In Progress'\|'Completed'\|'Closed'), installedAt, payment {mode,status,amount,date,balance,terms}, scrapCollected, dcRef, invoiceRef }`: the Power installation call was updated | sales updates the SO: `installationStatus` (Assigned → Scheduled, In Progress, Completed), `installationCompletionDate` (from `installedAt`), `deliveredDate`, `scrapCollected` and `installationCallId`. A Completed SO never moves back. |
+| `installation.completed` | service | `{ orderId, complaintId, completedAt, closedAt, payment, scrapCollected, scrapId, dcRef, invoiceRef }`: the installation call closed. Service has already re-based the warranty and PM plan on `completedAt`. | sales marks the SO installation Completed with that date. The resulting `orders:updated` is a no-op in service, so the two never loop. |
 | `stock.issue.requested` | service | `{ productId, stockId, item, qty, toEngineer, complaintId, spareRequestId, division }` | projects moves the qty from the warehouse or service centre into the engineer's stock (`moveStock`) and may raise a service DC (linkType 'Complaint') |
 | `stock.return.requested` | service | `{ …same, qty (returned), fromEngineer }` | projects moves it from the engineer back to the service centre |
 | `stock.consumed` | service | `{ …same, engineerId }` (spare used at site) | projects consumes it from engineer stock. Service never writes `stock` and checks availability as `current - reserved`. |
 | `scrap.create.requested` | service | `{ linkType: 'Installation'\|'Complaint'\|'OTS', linkId, complaintId, orderId?, otsId?, grnId?, customerId, division, scrapType, qty, brand?, capacity?, trigger, source, status, location, collectedBy, storedAt }` | projects inserts the `scrap` record synchronously. If no record exists afterwards, service inserts one itself with the projects schema. |
 | `service.centre.stage` | service | `{ complaintId, grnId, stage, stageName, grnStatus }` | projects advances the Service GRN when `grnStatus` is ahead (Pending Inward → Inward Created → Under Service → Ready for Dispatch → Delivered). Service pulls the reverse direction through `grns:updated`. |
-| `customer.message` | service | `{ channel, customerId, to, template, stage }` | integration hook for WhatsApp/SMS (simulated) |
+| `customer.message` | service | `{ channel, customerId, to, template, stage, text, ref }` | integration hook for WhatsApp/SMS (simulated) |
 | `report.dispatch` | executive | `{ report:'DRM'\|'WRM'\|'MRM', period, from, to, division, channel, recipients:[roleIds], summary:[{metric,value}] }` | integration hook for e-mail/WhatsApp report distribution (simulated) |
+
+### Module listeners on core events
+| Listener | Event | Does |
+|---|---|---|
+| sales | `ready`, `db:change` (sales collections), `tick` via `registerTick` | policy scan: reminders, escalations, payment-due alerts, sales violations |
+| projects | `ready` | late seed, flushes violations recorded while seeding, runs the stage/SLA scans |
+| service | `ready` | automation (SLA, escalation, PM, AMC renewal) |
+| service | `orders:updated` | Power SO edited by Sales: copies the installation date and scrap collection to the installation call and re-bases the warranty |
+| service | `grns:updated` | Service GRN status → service-centre stage of the linked complaint |
+| service | `notifications:created` | its own popup for severity `bad` (skipped when `CRM.notifyPopup` is true) |
 
 Modules may add events. Add every new event to this table.
 

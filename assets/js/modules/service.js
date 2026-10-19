@@ -240,7 +240,32 @@
       return v || '';
     } catch (e) { return ''; }
   }
-  const storable = (v) => { if (!v) return ''; try { return JSON.stringify(v).length <= 4000 ? v : 'captured'; } catch (e) { return 'captured'; } };
+  // Evidence is stored as real attachments (CRM.files → IndexedDB). The record keeps a reference 'ATT:<label>'; gates check the attachment exists.
+  // A typed-name signature (pad unavailable) is kept as text. Without CRM.files a small value is kept inline, a large one is not stored (gate fails).
+  const storable = (v) => v || '';
+  const evPending = {};
+  const isDataUrl = (x) => typeof x === 'string' && /^data:/.test(x);
+  function storeEv(value, recordType, recordId, key, label) {
+    const list = (Array.isArray(value) ? value : [value]).filter(Boolean);
+    if (!list.length) return '';
+    if (!list.some(isDataUrl)) return Array.isArray(value) ? list.join(', ') : value;
+    if (!(CRM.files && CRM.files.add)) { try { return JSON.stringify(value).length <= 4000 ? value : ''; } catch (e) { return ''; } }
+    const pk = recordType + ':' + recordId + ':' + label;
+    evPending[pk] = (evPending[pk] || 0) + 1;
+    Promise.all(list.filter(isDataUrl).map((d, i) => CRM.files.add(d, { recordType, recordId, label: list.length > 1 ? label + ' ' + (i + 1) : label })))
+      .catch((err) => { ui.toast(label + ' was not saved: ' + err.message, 'bad'); const r = db.get(recordType, recordId); if (r && r[key] === 'ATT:' + label) db.update(recordType, recordId, { [key]: '' }, { note: label + ' could not be stored' }); })
+      .then(() => { evPending[pk]--; });
+    return 'ATT:' + label;
+  }
+  /** Evidence present: an inline value, or an 'ATT:<label>' reference whose attachment exists (or is still being written). */
+  function evOk(rec, recordType, key) {
+    const v = rec && rec[key];
+    if (!v) return false;
+    if (typeof v !== 'string' || !/^ATT:/.test(v)) return true;
+    const label = v.slice(4);
+    if (evPending[recordType + ':' + rec.id + ':' + label] > 0) return true;
+    return !!(CRM.files && db.all('attachments').some((a) => a.recordType === recordType && a.recordId === rec.id && (a.label === label || a.label.indexOf(label + ' ') === 0)));
+  }
   function evidenceWidget(e) {
     const fn = e.kind === 'photo' ? ui.photoCapture : ui.signaturePad;
     if (typeof fn === 'function') {
@@ -490,7 +515,7 @@
       g.push({ label: 'Installation completed (engineer update)', ok: !!c.installedAt });
       g.push({ label: 'Payment status & mode recorded', ok: !!(pay.status && pay.mode), hint: pay.status ? pay.status + ' · ' + (pay.mode || '—') : 'not recorded' });
       if (c.scrapApplicable) g.push({ label: 'Scrap entry created (' + (c.scrapQty || 0) + ' × ' + (c.scrapType || 'scrap') + ')', ok: !!(c.scrapId || scrapFor(c).length) });
-      g.push({ label: 'Installation photo proof', ok: !!c.instPhotos });
+      g.push({ label: 'Installation photo proof (stored attachment)', ok: evOk(c, 'complaints', 'instPhotos') });
       g.push({ label: 'DC and invoice attached', ok: !!(d.dc && d.invoice), hint: 'DC ' + (d.dc || '—') + ' · invoice ' + (d.invoice || '—') });
     }
     if (c.serviceCentre) { const st = c.chargeable ? SC_STAGES.paid : SC_STAGES.free; g.push({ label: 'Service centre cycle complete (' + st[st.length - 1] + ')', ok: c.serviceCentre.stage >= st.length - 1 }); }
@@ -623,10 +648,29 @@
     if (db.find('complaints', (x) => x.customerId === o.customerId && util.daysBetween(x.createdAt, CRM.TODAY) < 90).length > 3) s -= 10;
     return Math.max(5, Math.min(95, s));
   }
+  // ---- follow-up tasks (collection serviceTasks): one open task per AMC opportunity, re-created on every logged follow-up
+  const FOLLOW_UP_DAYS = 2;
+  function openTask(t, opts) {
+    const cur = db.one('serviceTasks', (x) => x.refId === t.refId && x.type === t.type && x.status === 'Open');
+    if (cur) return db.update('serviceTasks', cur.id, { dueDate: t.dueDate, assignedTo: t.assignedTo || cur.assignedTo }, Object.assign({ note: 'Due date ' + t.dueDate }, opts || {}));
+    return db.insert('serviceTasks', Object.assign({ status: 'Open', createdBy: (CRM.user() || {}).id }, t), Object.assign({ prefix: 'SVT' }, opts || {}));
+  }
+  function closeTasks(refId, outcome, opts) {
+    db.find('serviceTasks', (x) => x.refId === refId && x.status === 'Open').forEach((x) => db.update('serviceTasks', x.id, { status: 'Done', doneAt: now().toISOString(), outcome: outcome || '' }, Object.assign({ note: 'Task closed: ' + (outcome || '') }, opts || {})));
+  }
+  const oppTask = (o, due, opts) => openTask({ type: 'AMC follow-up', refCol: 'amcOpportunities', refId: o.id, title: 'Follow up ' + o.type + ' ' + o.id + ' · ' + custName(o.customerId), division: o.division, customerId: o.customerId, assignedTo: o.assignedTo || 'EMP-pm_coordinator', dueDate: due, link: '#/amc/' + o.id }, opts);
   function createOpp(v, opts) {
-    const rec = db.insert('amcOpportunities', Object.assign({ status: 'Open', followups: [], assignedTo: 'EMP-pm_coordinator', createdBy: me(), quote: null }, v), Object.assign({ prefix: 'AMO' }, opts || {}));
+    const due = v.nextFollowUp || util.iso(util.addDays(CRM.TODAY, FOLLOW_UP_DAYS));
+    const rec = db.insert('amcOpportunities', Object.assign({ status: 'Open', followups: [], assignedTo: 'EMP-pm_coordinator', createdBy: me(), quote: null, nextFollowUp: due }, v), Object.assign({ prefix: 'AMO' }, opts || {}));
+    if (!['Won', 'Lost'].includes(rec.status)) oppTask(rec, rec.nextFollowUp || due, opts && opts.silent ? { silent: true } : undefined);
     return rec;
   }
+  // opportunity closed (Won / Lost) or reassigned → close / re-own its open follow-up task
+  CRM.on('amcOpportunities:updated', (o) => safe(() => {
+    if (!o) return;
+    if (['Won', 'Lost'].includes(o.status)) closeTasks(o.id, o.status);
+    else { const t = db.one('serviceTasks', (x) => x.refId === o.id && x.status === 'Open'); if (t && o.assignedTo && t.assignedTo !== o.assignedTo) db.update('serviceTasks', t.id, { assignedTo: o.assignedTo }, { silent: true }); }
+  }, null));
   function activateAmc(o) {
     const prev = o.contractId ? db.get('amcContracts', o.contractId) : null;
     const start = prev && notBefore(prev.end) ? util.addDays(parseD(prev.end), 1) : T0();
@@ -963,17 +1007,29 @@
     syncPlan(plan.id, opts);
     return plan;
   }
+  // project.handover equipment row → asset fields (make, model, camera tag separate from channel, capacity, warranty dates/terms)
+  function handoverAsset(p, e, site) {
+    const inst = util.iso(e.installDate || p.handoverAt || p.closedAt || CRM.TODAY);
+    const wStart = e.warrantyStart ? util.iso(e.warrantyStart) : null, wEnd = e.warrantyEnd ? util.iso(e.warrantyEnd) : null;
+    const wm = wStart && wEnd ? Math.max(1, Math.round(util.daysBetween(wStart, util.addDays(parseD(wEnd), 1)) / 30.44)) : undefined;
+    return { customerId: p.customerId, siteId: site, projectId: p.id, division: p.division || (master.product(e.productId) || {}).division || 'Electronic Security', productId: e.productId, name: e.name, category: e.type, make: e.make || e.brand, model: e.model, serial: e.serial, location: e.location, channel: e.channel || '', tag: e.tag || '', capacity: e.capacity || (e.capacityKw ? e.capacityKw + ' kW' : p.capacityKw ? p.capacityKw + ' kW' : ''), qty: e.qty || 1, installDate: inst, commissionDate: util.iso(anyField(p, ['commissionedAt', 'commissioningAt', 'commissioningCertAt']) || inst), warrantyStart: wStart, warrantyEnd: wEnd, warrantyMonths: wm, warrantyTerms: e.warrantyTerms, commissioningReportNo: p.commissioningReportNo };
+  }
   CRM.on('project.handover', (payload) => {
     const p = (payload && payload.project) || null; if (!p) return;
     if (db.one('assets', (a) => a.projectId === p.id)) return;
     const site = p.siteId || (master.sites(p.customerId)[0] || {}).id;
     const eq = (payload.equipment && payload.equipment.length) ? payload.equipment : [{ productId: p.productId, name: p.product || p.name || p.title }];
-    const assets = eq.map((e) => createAsset({ customerId: p.customerId, siteId: site, projectId: p.id, division: p.division || (master.product(e.productId) || {}).division || 'Electronic Security', productId: e.productId, name: e.name, category: e.type, make: e.make || e.brand, serial: e.serial, location: e.location, channel: e.channel || '', tag: e.tag || '', capacity: e.capacity || (e.capacityKw ? e.capacityKw + ' kW' : p.capacityKw ? p.capacityKw + ' kW' : ''), qty: e.qty || 1, installDate: util.iso(p.handoverAt || CRM.TODAY), commissionDate: util.iso(anyField(p, ['commissionedAt', 'commissioningAt', 'commissioningCertAt']) || p.handoverAt || CRM.TODAY) }));
+    const assets = eq.map((e) => createAsset(handoverAsset(p, e, site)));
     const groups = util.groupBy(assets, 'eqType');
     const plans = Object.keys(groups).map((k) => pmPlanFromAssets(groups[k]));
     CRM.notify({ to: ['pm_coordinator'], title: 'Handover received: ' + (p.name || p.title || p.id), body: assets.length + ' assets registered · warranty activated · ' + plans.length + ' PM plan(s) created for ' + custName(p.customerId), link: '#/pm', severity: 'ok', key: 'handover-' + p.id });
     CRM.notify({ to: ['service_coordinator'], title: 'New installed base: ' + custName(p.customerId), body: assets.length + ' equipment records added to the asset register (' + (p.division || '') + ')', link: '#/assets', key: 'handover-svc-' + p.id });
   });
+  // projects.js created the installation project for a "Project Installation" call → link the complaint to it
+  CRM.on('project.installation.created', (p) => safe(() => {
+    const c = p && p.complaintId && db.get('complaints', p.complaintId);
+    if (c && p.projectId && c.projectId !== p.projectId) db.update('complaints', c.id, { projectId: p.projectId }, { note: 'Linked to installation project ' + p.projectId });
+  }, null));
   CRM.on('order.won', (payload) => {
     const o = (payload && payload.order) || null;
     if (!o || o.division !== 'Power' || db.one('assets', (a) => a.orderId === o.id) || db.one('complaints', (c) => c.orderId === o.id && c.callType === 'Installation')) return;
@@ -1274,7 +1330,7 @@
     // ---- handed-over projects (if present): assets + warranty PM plan
     dbx.all('projects').filter((p) => /handover|handed|closed|complete/i.test(p.status || p.stage || '') && !dbx.one('assets', (a) => a.projectId === p.id)).slice(0, 10).forEach((p) => safe(() => {
       const devs = (p.devices && p.devices.length ? p.devices : master.products(p.division || 'Electronic Security').slice(0, 3).map((pr) => ({ productId: pr.id, name: pr.name }))).slice(0, 8);
-      const list = devs.map((d, k) => createAsset({ customerId: p.customerId, siteId: p.siteId || (master.sites(p.customerId)[0] || {}).id, projectId: p.id, division: p.division || 'Electronic Security', productId: d.productId, name: d.name, category: d.type, serial: d.serial, location: d.location, channel: d.channel || d.tag || '', installDate: util.iso(p.handoverAt || p.closedAt || p.updatedAt || CRM.TODAY) }, S));
+      const list = devs.map((d, k) => createAsset({ customerId: p.customerId, siteId: p.siteId || (master.sites(p.customerId)[0] || {}).id, projectId: p.id, division: p.division || 'Electronic Security', productId: d.productId, name: d.name, category: d.type, serial: d.serial, location: d.location, channel: d.channel || '', tag: d.tag || '', installDate: util.iso(p.handoverAt || p.closedAt || p.updatedAt || CRM.TODAY) }, S));
       Object.values(util.groupBy(list, 'eqType')).forEach((g) => catchUp(pmPlanFromAssets(g, {}, S), 1));
     }, null));
 
@@ -1469,10 +1525,22 @@
       });
     },
     checkin(c) {
-      const geo = (11 + Math.random() / 10).toFixed(4) + ', ' + (76.9 + Math.random() / 10).toFixed(4);
-      updC(c, { attendedAt: now().toISOString(), visits: (c.visits || 0) + 1, geo }, 'Engineer checked in (' + geo + ')');
+      // attendance time is recorded at once; the geo-tag comes from the device GPS (navigator.geolocation) and falls back to a labelled simulated value
+      const simulated = (why) => (11 + Math.random() / 10).toFixed(4) + ', ' + (76.9 + Math.random() / 10).toFixed(4) + ' (simulated — ' + why + ')';
+      const setGeo = (geo, src) => { const cur = db.get('complaints', c.id); if (cur && cur.attendedAt && (!cur.geo || cur.geoSource === 'pending')) db.update('complaints', c.id, { geo, geoSource: src }, { note: 'Check-in geo-tag: ' + geo }); };
+      const hasGps = typeof navigator !== 'undefined' && navigator.geolocation && (typeof window === 'undefined' || window.isSecureContext !== false);
+      updC(c, { attendedAt: now().toISOString(), visits: (c.visits || 0) + 1, geo: hasGps ? 'Locating…' : simulated('location unavailable on this device'), geoSource: hasGps ? 'pending' : 'simulated' }, 'Engineer checked in');
+      if (hasGps) {
+        let settled = false;
+        const fail = (why) => { if (settled) return; settled = true; setGeo(simulated(why), 'simulated'); };
+        try {
+          navigator.geolocation.getCurrentPosition((pos) => { if (settled) return; settled = true; setGeo(pos.coords.latitude.toFixed(5) + ', ' + pos.coords.longitude.toFixed(5) + ' (GPS ±' + Math.round(pos.coords.accuracy || 0) + ' m)', 'gps'); },
+            (err) => fail(err && err.code === 1 ? 'location permission denied' : 'location unavailable'), { enableHighAccuracy: true, timeout: 8000, maximumAge: 60000 });
+        } catch (e) { fail('location unavailable'); }
+        setTimeout(() => fail('location timed out'), 9000);
+      }
       const s = slaState(Object.assign({}, c, { attendedAt: now().toISOString() }), 'attend');
-      ui.toast('Checked in · geo-tag ' + geo + ' · attendance SLA ' + s, s === 'Met' ? 'ok' : 'warn');
+      ui.toast('Checked in · ' + (hasGps ? 'reading GPS location' : 'geo-tag simulated (no location on this device)') + ' · attendance SLA ' + s, s === 'Met' ? 'ok' : 'warn');
       if (c.commitAt && Date.now() > new Date(c.commitAt).getTime()) note(c, 'Commitment mismatch: attended after committed time ' + fmt.dateTime(c.commitAt));
     },
     diagnose(c, after) {
@@ -1534,7 +1602,7 @@
         if (!cl.complete()) { ui.toast('Blocked: all functional tests must be completed before proceeding', 'bad'); return false; }
         const v = f.values();
         issued.forEach((s) => { const st = v['sp_' + s.id]; db.update('spareRequests', s.id, { status: st, usedQty: st === 'Used' ? s.qty : 0, returnedQty: st === 'Returned' ? s.qty : 0, closedAt: now().toISOString() }, { note: 'Spare ' + st }); if (st === 'Returned') stockEvent('stock.return.requested', s, { fromEngineer: c.engineerId }); else stockEvent('stock.consumed', s, { engineerId: c.engineerId }); });
-        updC(c, { actionTaken: v.actionTaken, readings: v.readings, tests: state, photosBefore: pb.get() || c.photosBefore || '', photosAfter: pa.get() || c.photosAfter || '', problemResolved: v.problemResolved === 'Yes', repairedAt: now().toISOString(), step: 8 }, 'Repair & testing completed');
+        updC(c, { actionTaken: v.actionTaken, readings: v.readings, tests: state, photosBefore: storeEv(pb.get(), 'complaints', c.id, 'photosBefore', 'Before-service photo') || c.photosBefore || '', photosAfter: storeEv(pa.get(), 'complaints', c.id, 'photosAfter', 'After-service photo') || c.photosAfter || '', problemResolved: v.problemResolved === 'Yes', repairedAt: now().toISOString(), step: 8 }, 'Repair & testing completed');
         reopenAfter(() => {});
       } }] });
     },
@@ -1545,7 +1613,7 @@
         { key: 'satisfied', label: 'Customer confirms the work is completed', type: 'checkbox', required: true },
         { key: 'summary', label: 'Report summary', type: 'textarea' },
       ], { serviceReportNo: 'SR-' + c.id.slice(4) }, [{ key: 'signature', kind: 'signature', label: 'Customer signature', required: true, default: (master.customer(c.customerId) || {}).contact }], (v) => {
-        updC(c, { serviceReportNo: v.serviceReportNo, confirmMode: v.confirmMode, signature: v.signature, customerConfirmed: true, reportSummary: v.summary, reportAt: now().toISOString(), step: 9 }, 'Service report submitted');
+        updC(c, { serviceReportNo: v.serviceReportNo, confirmMode: v.confirmMode, signature: storeEv(v.signature, 'complaints', c.id, 'signature', 'Customer signature (service report)'), customerConfirmed: true, reportSummary: v.summary, reportAt: now().toISOString(), step: 9 }, 'Service report submitted');
       });
     },
     approve(c) { updC(c, { closureApprovedBy: me(), closureApprovedAt: now().toISOString() }, 'Closure approved'); ui.toast('Closure approved', 'ok'); CRM.refresh(); },
@@ -1625,7 +1693,7 @@
       [{ key: 'photos', kind: 'photo', label: 'Installation photo proof' }, { key: 'signature', kind: 'signature', label: 'Customer signature', default: (master.customer(c.customerId) || {}).contact }], (v) => {
         if (v.payStatus !== 'Pending' && !(v.payAmount > 0)) { ui.toast('Enter the amount collected', 'bad'); return false; }
         const t = now().toISOString();
-        const patch = { battery: clean({ brand: v.batteryBrand, model: v.batteryModel, qty: v.batteryQty, capacity: v.batteryCapacity }), instPayment: clean({ mode: v.payMode, status: v.payStatus, amount: v.payAmount, date: v.payDate, balance: Math.max(0, (Number(c.billValue) || 0) - (Number(v.payAmount) || 0)), terms: pay.terms }), dcRef: v.dcRef, invoiceRef: v.invoiceRef, instPhotos: v.photos || c.instPhotos || '', instSignature: v.signature || c.instSignature || '' };
+        const patch = { battery: clean({ brand: v.batteryBrand, model: v.batteryModel, qty: v.batteryQty, capacity: v.batteryCapacity }), instPayment: clean({ mode: v.payMode, status: v.payStatus, amount: v.payAmount, date: v.payDate, balance: Math.max(0, (Number(c.billValue) || 0) - (Number(v.payAmount) || 0)), terms: pay.terms }), dcRef: v.dcRef, invoiceRef: v.invoiceRef, instPhotos: storeEv(v.photos, 'complaints', c.id, 'instPhotos', 'Installation photo proof') || c.instPhotos || '', instSignature: storeEv(v.signature, 'complaints', c.id, 'instSignature', 'Customer signature (installation)') || c.instSignature || '' };
         if (v.installed && !c.installedAt) patch.installedAt = t;
         if (c.scrapApplicable) { patch.scrapType = v.scrapType; patch.scrapQty = Number(v.scrapQty) || 0; }
         if (c.scrapApplicable && Number(v.scrapQty) > 0 && !c.scrapId) {
@@ -1824,7 +1892,7 @@
       ui.dl([['Installation status', ui.badge(st, st === 'Closed' || st === 'Completed' ? 'ok' : 'warn')], ['SO status (Sales)', o ? (o.installationStatus || '—') + (o.installationCompletionDate ? ' · ' + fmt.date(o.installationCompletionDate) : '') : '—'], ['Product / qty', (c.productType || c.productDetails || '') + ' × ' + (c.qty || 1)], ['Battery details', b.brand || b.model ? [b.brand, b.model, b.qty ? b.qty + ' nos' : '', b.capacity].filter(Boolean).join(' · ') : '—'], ['Bill value', fmt.money(c.billValue)],
         ['Payment mode / status', (pay.mode || '—') + ' · ' + (pay.status || 'Pending') + (pay.terms ? ' (terms: ' + pay.terms + ')' : '')], ['Collected / balance', fmt.money(pay.amount) + ' / ' + fmt.money(pay.balance != null ? pay.balance : (Number(c.billValue) || 0) - (Number(pay.amount) || 0))],
         ['Scrap', c.scrapApplicable ? (c.scrapQty || 0) + ' × ' + (c.scrapType || 'scrap') + ' · ' + (c.scrapId ? 'entry ' + c.scrapId : c.scrapCollectedAt ? 'collected ' + fmt.date(c.scrapCollectedAt) : 'pending') : 'Not applicable'],
-        ['Delivery challan', d.dc || '—'], ['Invoice', d.invoice || '—'], ['Installed at', fmt.dateTime(c.installedAt)], ['Photo proof / signature', (c.instPhotos ? '✓' : '✗') + ' / ' + (c.instSignature || '✗')]]),
+        ['Delivery challan', d.dc || '—'], ['Invoice', d.invoice || '—'], ['Installed at', fmt.dateTime(c.installedAt)], ['Photo proof / signature', (evOk(c, 'complaints', 'instPhotos') ? '✓' : '✗') + ' / ' + (c.instSignature ? (/^ATT:/.test(c.instSignature) ? '✓ signed' : c.instSignature) : '✗')]]),
     ]);
   }
   function obsPanel(c) {
@@ -2059,6 +2127,7 @@
         if (c.observation && !c.observation.outcome) acts.push(big('🔁 Observation revisit outcome', () => A.observation(c), 'primary', own));
         if (s === 9) acts.push(h('div', { class: 'callout ok' }, 'Submitted — awaiting coordinator closure' + (needsApproval(c) ? ' & approval' : '')));
         if (s >= 5) acts.push(big('💰 Quick OTS (replacement / upgrade)', () => openOtsForm(c), '', own));
+        if (s >= 5 && c.status !== 'Closed') acts.push(big('📦 Quick GRN (take product to service centre)', () => quickGrn(c), '', own));
         if (s < 4) acts.push(h('div', { class: 'callout' }, 'Waiting for coordinator (' + STEPS[s] + ')'));
         acts.filter(Boolean).forEach((x) => content.appendChild(x));
         const reqs = spareReqs(c.id);
@@ -2087,6 +2156,39 @@
   });
 
   // ---------------------------------------------------------------- OTS — Opportunity Through Service
+  // ---- mobile Quick GRN: the engineer collects the customer's product. GRN records are projects-owned, so the request goes through
+  // 'grn.service.requested' (projects inserts the Service GRN synchronously); the photo is attached to the GRN record.
+  function scanInput(input) {
+    const supported = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+    const pc = supported && ui.photoCapture ? ui.photoCapture({ label: '📷 Scan barcode / QR', onChange: (d) => { if (!d) return; const img = new Image(); img.onload = () => { try { new window.BarcodeDetector().detect(img).then((r) => { if (r && r[0]) { input.value = r[0].rawValue; input.dispatchEvent(new Event('input', { bubbles: true })); ui.toast('Scanned: ' + r[0].rawValue, 'ok'); } else ui.toast('No barcode found — type the serial number', 'warn'); }).catch(() => ui.toast('Barcode scan failed — type the serial number', 'warn')); } catch (e) { ui.toast('Barcode scan unavailable — type the serial number', 'warn'); } }; img.src = d; } }) : null;
+    return h('div', { class: 'small muted' }, pc ? [pc] : ['Barcode scanning is not supported in this browser — type or paste the serial / barcode (a USB / Bluetooth scanner types into the field).']);
+  }
+  function quickGrn(c) {
+    const a = c.assetId ? db.get('assets', c.assetId) : null; const cust = master.customer(c.customerId) || {};
+    const existing = db.one('grns', (g) => g.type === 'Service GRN' && g.complaintId === c.id && g.status !== 'Delivered');
+    if (existing) { ui.toast('Service GRN ' + existing.id + ' already exists for ' + c.id, 'warn'); return; }
+    const f = ui.form([
+      { key: 'productType', label: 'Product type', type: 'select', required: true, options: ['UPS', 'Inverter', 'Battery', 'Stabilizer', 'DVR/NVR', 'Camera', 'Solar inverter', 'Other'] },
+      { key: 'brand', label: 'Brand', required: true }, { key: 'model', label: 'Model', required: true },
+      { key: 'serial', label: 'Serial number / barcode', required: true }, { key: 'qty', label: 'Quantity', type: 'number', required: true },
+      { key: 'condition', label: 'Physical condition', type: 'select', required: true, options: ['Good', 'Damaged'] },
+      { key: 'accessories', label: 'Accessories received', required: true }, { key: 'problem', label: 'Problem description', type: 'textarea', required: true },
+    ], { productType: /UPS/i.test((a && a.category) || '') ? 'UPS' : /Inverter/i.test((a && a.category) || '') ? 'Inverter' : /Battery/i.test((a && a.category) || '') ? 'Battery' : c.division === 'Electronic Security' ? 'DVR/NVR' : c.division === 'Solar' ? 'Solar inverter' : 'Other', brand: (a && a.make) || '', model: (a && a.model) || c.model || '', serial: (a && a.serial) || c.serial || '', qty: 1, condition: 'Good', accessories: 'No', problem: c.diagnosis || c.description || '' });
+    const serialIn = (f.inputs && f.inputs.serial) || null;
+    const photo = evidenceWidget({ kind: 'photo', label: 'Photo of the product collected' });
+    ui.modal({ title: 'Quick GRN · ' + c.id, sub: cust.name + ' · ' + (cust.phone || ''), body: h('div', { class: 'stack' }, [f, serialIn ? scanInput(serialIn) : null, h('div', { class: 'form' }, [photo.node])].filter(Boolean)), actions: [{ label: 'Cancel' }, { label: 'Create GRN', cls: 'primary', onClick: () => {
+      if (!f.validate()) return false; const v = f.values();
+      if (!(v.qty > 0)) { ui.toast('Quantity must be at least 1', 'bad'); return false; }
+      const ph = photo.get(); if (!ph) { ui.toast('Photo of the collected product is mandatory', 'bad'); return false; }
+      const payload = Object.assign({ complaintId: c.id, customerId: c.customerId, division: c.division, contact: c.contact || cust.phone || '', site: c.address || cust.area || '', collectedBy: me(), source: 'Mobile quick GRN' }, v);
+      CRM.emit('grn.service.requested', payload);
+      const g = db.one('grns', (x) => x.type === 'Service GRN' && x.complaintId === c.id && x.serial === v.serial && x.status !== 'Delivered');
+      if (!g) { ui.toast('GRN could not be created — the stores module is unavailable', 'bad'); return false; }
+      const ref = storeEv(ph, 'grns', g.id, 'photo', 'Product photo at collection'); if (ref) db.update('grns', g.id, { photo: ref }, { silent: true });
+      updC(db.get('complaints', c.id), { quickGrnId: g.id }, 'Quick GRN ' + g.id + ' created on mobile');
+      ui.toast(g.id + ' created — product in transit to the service centre', 'ok'); reopenAfter(() => {});
+    } }] });
+  }
   function openOtsForm(c) {
     const cust = master.customer(c.customerId) || {};
     const th = Number(cfg().otsBatteryThreshold) || 2;
@@ -2108,7 +2210,8 @@
       if (!(v.qty > 0)) { ui.toast('Quantity must be at least 1', 'bad'); return false; }
       // Service doc OTS §2: the back-office coordinator may create Service OTS only
       if (roleIs('service_coordinator') && otsType(v.qty, v.productType) === 'Sales OTS') { ui.toast('Blocked: coordinators may create Service OTS only — the engineer logs Sales OTS', 'bad'); return false; }
-      const o = createOts(Object.assign(v, { photo: photo.get(), division: c.division, complaintId: c.id, customerId: c.customerId, contact: c.contact, createdBy: c.engineerId || me() }));
+      const ph = photo.get(); const o = createOts(Object.assign(v, { photo: ph && !isDataUrl(ph) && !Array.isArray(ph) ? ph : '', division: c.division, complaintId: c.id, customerId: c.customerId, contact: c.contact, createdBy: c.engineerId || me() }));
+      if (ph) { const ref = storeEv(ph, 'ots', o.id, 'photo', 'OTS equipment photo'); if (ref) db.update('ots', o.id, { photo: ref }, { silent: true }); }
       ui.toast(o.id + ' created as ' + o.otsType, 'ok'); reopenAfter(() => {});
     } }] });
   }
@@ -2122,12 +2225,25 @@
     const acts = [];
     if (o.otsType === 'Sales OTS' && roleIs('sales_coordinator', 'sales_manager', 'admin') && !['Won', 'Lost'].includes(o.status)) acts.push({ label: o.assignedTo ? 'Reassign' : 'Assign Sales Executive', cls: 'primary', onClick: () => { ui.formModal('Assign Sales OTS', [{ key: 'assignedTo', label: 'Sales Executive', type: 'select', options: staffOpts('sales_exec'), required: true }], { assignedTo: o.assignedTo }, (v) => { db.update('ots', o.id, { assignedTo: v.assignedTo, status: o.status === 'Open' ? 'In Progress' : o.status }, { note: 'Assigned to ' + master.staffName(v.assignedTo) }); CRM.notify({ to: ['sales_exec'], title: 'Sales OTS assigned: ' + o.id, body: o.qty + ' batteries · ' + custName(o.customerId), link: '#/ots/' + o.id, key: 'ots-asg-' + o.id + v.assignedTo }); reopenAfter(() => openOts(o.id)); }); return false; } });
     if (can && !['Won', 'Lost'].includes(o.status)) {
-      next.forEach((s) => acts.push({ label: '→ ' + s, onClick: () => { const p = { status: s }; if (s === 'Quotation Sent') p.quoteNo = 'OQ-' + o.id.slice(4); db.update('ots', o.id, p, { note: 'Status ' + s }); reopenAfter(() => openOts(o.id)); return false; } }));
+      // Service OTS: quotation value → coordinator approval → "Quotation Sent" (Sales OTS quotations live in the Sales CRM)
+      const svcQuote = o.otsType === 'Service OTS';
+      if (svcQuote && OTS_STATUS.indexOf(o.status) < 2) acts.push({ label: o.quoteValue ? 'Revise quotation' : 'Prepare quotation', onClick: () => { ui.formModal('Quotation for ' + o.id, [{ key: 'quoteValue', label: 'Quotation value ₹ (incl. GST)', type: 'number', required: true }, { key: 'quoteNote', label: 'Items / terms', type: 'textarea' }], { quoteValue: o.quoteValue || Math.round(o.value * (1 - (o.discountPct || 0) / 100)), quoteNote: o.quoteNote || ((o.qty || 1) + ' × ' + (o.productType || 'Battery') + ' ' + (o.brand || '') + ' ' + (o.capacity || '')) }, (v) => {
+        if (!(v.quoteValue > 0)) { ui.toast('Quotation value must be greater than zero', 'bad'); return false; }
+        const self = roleIs('service_coordinator', 'admin');
+        db.update('ots', o.id, { quoteValue: v.quoteValue, quoteNote: v.quoteNote, quoteNo: o.quoteNo || 'OQ-' + o.id.slice(4), quoteRev: (o.quoteRev || 0) + (o.quoteValue ? 1 : 0), quoteApproval: self ? 'Approved' : 'Pending', quoteApprovedBy: self ? me() : null, quoteApprovedAt: self ? now().toISOString() : null }, { note: 'Quotation ' + fmt.money(v.quoteValue) + (self ? ' (approved)' : ' submitted for approval') });
+        if (!self) CRM.notify({ to: ['service_coordinator'], title: 'OTS quotation awaiting approval: ' + o.id, body: fmt.money(v.quoteValue) + ' · ' + custName(o.customerId), link: '#/ots/' + o.id, severity: 'warn', key: 'ots-q-' + o.id + '-' + ((o.quoteRev || 0) + 1) });
+        reopenAfter(() => openOts(o.id));
+      }); return false; } });
+      if (svcQuote && o.quoteApproval === 'Pending' && roleIs('service_coordinator', 'admin')) acts.push({ label: 'Approve quotation', cls: 'ok', onClick: () => { db.update('ots', o.id, { quoteApproval: 'Approved', quoteApprovedBy: me(), quoteApprovedAt: now().toISOString() }, { note: 'Quotation approved' }); reopenAfter(() => openOts(o.id)); return false; } });
+      next.forEach((s) => acts.push({ label: '→ ' + s, onClick: () => {
+        if (svcQuote && OTS_STATUS.indexOf(s) >= 2 && o.quoteApproval !== 'Approved') { ui.toast('Blocked: prepare the quotation and get it approved by the Service Coordinator first', 'bad'); return false; }
+        const p = { status: s }; if (s === 'Quotation Sent') { p.quoteNo = o.quoteNo || 'OQ-' + o.id.slice(4); p.quoteSentAt = now().toISOString(); }
+        db.update('ots', o.id, p, { note: 'Status ' + s }); reopenAfter(() => openOts(o.id)); return false; } }));
       acts.push({ label: 'Discount', onClick: () => { ui.formModal('Discount request', [{ key: 'discountPct', label: 'Discount %', type: 'number', required: true }], { discountPct: o.discountPct || 0 }, (v) => { const need = v.discountPct > cfg().discountLimit; db.update('ots', o.id, { discountPct: v.discountPct, discountApproval: need ? 'Pending' : 'Within limit' }, { note: 'Discount ' + v.discountPct + '%' }); if (need) CRM.notify({ to: ['gm', 'sales_manager'], title: 'Discount approval: ' + o.id + ' (' + v.discountPct + '%)', body: 'Beyond the ' + cfg().discountLimit + '% limit', link: '#/ots/' + o.id, severity: 'warn', key: 'ots-disc-' + o.id + v.discountPct }); reopenAfter(() => openOts(o.id)); }); return false; } });
-      acts.push({ label: 'Mark Won', cls: 'ok', onClick: () => { if (discNeeds) { ui.toast('Blocked: discount beyond ' + cfg().discountLimit + '% awaits approval', 'bad'); return false; } ui.formModal('Mark OTS Won', [{ key: 'revenue', label: 'Revenue value ₹', type: 'number', required: true }, { key: 'invoiceNo', label: 'Invoice / order ref' }, { key: 'scrap', label: 'Old material (scrap entry is mandatory for replacements)', type: 'select', options: ['Collected — create scrap entry', 'Not a replacement (new / additional)', 'Customer retained old material'], required: true }, { key: 'scrapQty', label: 'Old units collected', type: 'number' }], { revenue: Math.round(o.value * (1 - (o.discountPct || 0) / 100)), scrap: 'Collected — create scrap entry', scrapQty: o.qty }, (v) => {
+      acts.push({ label: 'Mark Won', cls: 'ok', onClick: () => { if (discNeeds) { ui.toast('Blocked: discount beyond ' + cfg().discountLimit + '% awaits approval', 'bad'); return false; } ui.formModal('Mark OTS Won', [{ key: 'revenue', label: 'Revenue value ₹', type: 'number', required: true }, { key: 'invoiceId', label: 'Sales invoice (from Accounts)', type: 'select', options: [{ value: '', label: 'Not invoiced yet — Accounts will be asked to bill' }].concat(db.find('invoices', (x) => x.customerId === o.customerId).sort((a, b) => (a.invoiceDate < b.invoiceDate ? 1 : -1)).slice(0, 30).map((x) => ({ value: x.id, label: (x.invoiceNo || x.id) + ' · ' + fmt.date(x.invoiceDate) + ' · ' + fmt.money(x.value) }))) }, { key: 'scrap', label: 'Old material (scrap entry is mandatory for replacements)', type: 'select', options: ['Collected — create scrap entry', 'Not a replacement (new / additional)', 'Customer retained old material'], required: true }, { key: 'scrapQty', label: 'Old units collected', type: 'number' }], { revenue: o.quoteValue || Math.round(o.value * (1 - (o.discountPct || 0) / 100)), scrap: 'Collected — create scrap entry', scrapQty: o.qty, invoiceId: o.invoiceId || '' }, (v) => {
         let scrapId = null;
         if (/^Collected/.test(v.scrap)) { if (!(v.scrapQty > 0)) { ui.toast('Enter the number of old units collected', 'bad'); return false; } const cmp = o.complaintId && db.get('complaints', o.complaintId); const g = cmp ? grnFor(cmp) : null; const sr = requestScrap({ linkType: 'OTS', linkId: o.id, otsId: o.id, complaintId: o.complaintId || null, grnId: g ? g.id : null, customerId: o.customerId, division: o.division || 'Power', scrapType: o.productType === 'Battery' ? 'Battery' : o.productType, brand: o.brand, capacity: o.capacity, qty: v.scrapQty, trigger: 'OTS replacement — old ' + (o.productType || 'battery'), source: 'From OTS', status: 'Collected', location: o.location }); scrapId = sr ? sr.id : null; }
-        db.update('ots', o.id, { status: 'Won', revenue: v.revenue, invoiceNo: v.invoiceNo, closedBy: me(), closedAt: now().toISOString(), scrapDecision: v.scrap, scrapId }, { note: 'Won' + (scrapId ? ' · scrap ' + scrapId : '') }); CRM.notify({ to: ['accounts'], title: 'Trigger billing: OTS ' + o.id + ' won', body: fmt.money(v.revenue) + ' · ' + custName(o.customerId), link: '#/svc-billing', severity: 'ok', key: 'ots-won-' + o.id }); reopenAfter(() => openOts(o.id)); }); return false; } });
+        const inv = v.invoiceId ? db.get('invoices', v.invoiceId) : null; db.update('ots', o.id, { status: 'Won', revenue: v.revenue, invoiceId: inv ? inv.id : null, invoiceNo: inv ? inv.invoiceNo || inv.id : '', closedBy: me(), closedAt: now().toISOString(), scrapDecision: v.scrap, scrapId }, { note: 'Won' + (scrapId ? ' · scrap ' + scrapId : '') }); CRM.notify({ to: ['accounts'], title: 'Trigger billing: OTS ' + o.id + ' won', body: fmt.money(v.revenue) + ' · ' + custName(o.customerId), link: '#/svc-billing', severity: 'ok', key: 'ots-won-' + o.id }); reopenAfter(() => openOts(o.id)); }); return false; } });
       acts.push({ label: 'Mark Lost', cls: 'danger', onClick: () => { ui.formModal('Mark OTS Lost (OTS cannot be deleted)', [{ key: 'lostReason', label: 'Lost reason', type: 'select', options: ['Price too high', 'Bought from local dealer', 'Customer postponed', 'Not required after repair', 'Other'], required: true }], {}, (v) => { db.update('ots', o.id, { status: 'Lost', lostReason: v.lostReason, closedBy: me(), closedAt: now().toISOString() }, { note: 'Lost: ' + v.lostReason }); reopenAfter(() => openOts(o.id)); }); return false; } });
     }
     if (o.discountApproval === 'Pending' && roleIs('gm', 'sales_manager', 'admin')) acts.push({ label: 'Approve discount', cls: 'ok', onClick: () => { db.update('ots', o.id, { discountApproval: 'Approved', discountApprovedBy: me() }, { note: 'Discount approved' }); reopenAfter(() => openOts(o.id)); return false; } });
@@ -2135,7 +2251,7 @@
       ui.stepper(OTS_STATUS.slice(0, 5), o.status === 'Lost' ? 4 : o.status === 'Won' ? 5 : i, o.status === 'Lost'),
       o.status === 'Lost' ? txtCallout('Lost — ' + o.lostReason, 'bad') : null,
       discNeeds ? txtCallout('Discount ' + o.discountPct + '% exceeds the ' + cfg().discountLimit + '% limit — approval required', 'warn') : null,
-      ui.dl([['OTS ID', o.id], ['Linked complaint', o.complaintId ? link('#/complaints/' + o.complaintId, o.complaintId) : '—'], ['Customer', custName(o.customerId)], ['Contact', o.contact], ['Location', o.location], ['Product type', o.productType], ['Battery brand', o.brand], ['Battery quantity', o.qty], ['Capacity', o.capacity], ['OTS type (auto)', o.otsType], ['Department', o.department], ['Estimated value', fmt.money(o.value)], ['Urgency', ui.badge(o.urgency, o.urgency === 'Hot' ? 'bad' : o.urgency === 'Warm' ? 'warn' : 'info')], ['Expected closure', fmt.date(o.expectedClose)], ['Created by', master.staffName(o.createdBy)], ['Assigned to', o.assignedTo ? master.staffName(o.assignedTo) : ui.badge('Awaiting assignment', 'warn')], ['Closed by', master.staffName(o.closedBy)], ['Revenue', fmt.money(o.revenue)], ['Incentive eligible', o.incentiveEligible], ['Incentive (auto)', fmt.money(otsIncentive(o))], ['Discount', (o.discountPct || 0) + '% ' + (o.discountApproval || '')], ['Quotation', o.quoteNo || '—'], ['Sales order', o.orderId || '—'], ['Converted to enquiry', o.converted ? (o.enquiryId || 'Yes') + ' · ' + fmt.date(o.convertedAt) : '—'], ['Scrap (old material)', o.scrapId ? o.scrapId : (o.scrapDecision || '—')], ['Condition photo', o.photo ? '✓' : '—']]),
+      ui.dl([['OTS ID', o.id], ['Linked complaint', o.complaintId ? link('#/complaints/' + o.complaintId, o.complaintId) : '—'], ['Customer', custName(o.customerId)], ['Contact', o.contact], ['Location', o.location], ['Product type', o.productType], ['Battery brand', o.brand], ['Battery quantity', o.qty], ['Capacity', o.capacity], ['OTS type (auto)', o.otsType], ['Department', o.department], ['Estimated value', fmt.money(o.value)], ['Quotation', o.quoteValue ? (o.quoteNo || '') + ' · ' + fmt.money(o.quoteValue) + ' · ' + (o.quoteApproval || '—') : '—'], ['Invoice', o.invoiceId ? (CRM.canSee('invoices') ? link('#/invoices', o.invoiceNo || o.invoiceId) : (o.invoiceNo || o.invoiceId)) : (o.invoiceNo || '—')], ['Urgency', ui.badge(o.urgency, o.urgency === 'Hot' ? 'bad' : o.urgency === 'Warm' ? 'warn' : 'info')], ['Expected closure', fmt.date(o.expectedClose)], ['Created by', master.staffName(o.createdBy)], ['Assigned to', o.assignedTo ? master.staffName(o.assignedTo) : ui.badge('Awaiting assignment', 'warn')], ['Closed by', master.staffName(o.closedBy)], ['Revenue', fmt.money(o.revenue)], ['Incentive eligible', o.incentiveEligible], ['Incentive (auto)', fmt.money(otsIncentive(o))], ['Discount', (o.discountPct || 0) + '% ' + (o.discountApproval || '')], ['Quotation', o.quoteNo || '—'], ['Sales order', o.orderId || '—'], ['Converted to enquiry', o.converted ? (o.enquiryId || 'Yes') + ' · ' + fmt.date(o.convertedAt) : '—'], ['Scrap (old material)', o.scrapId ? o.scrapId : (o.scrapDecision || '—')], ['Condition photo', o.photo ? '✓' : '—']]),
       ui.card('Audit trail', ui.auditTrail('ots', o.id)),
     ]) });
   }
@@ -2350,7 +2466,7 @@
     const re = () => reopenAfter(() => openOpp(o.id));
     const acts = [];
     if (can && !['Won', 'Lost'].includes(o.status)) {
-      acts.push({ label: 'Log follow-up', onClick: () => { ui.formModal('Follow-up (call / visit)', [{ key: 'mode', label: 'Mode', type: 'select', options: ['Call', 'Visit', 'Email', 'WhatsApp'], required: true }, { key: 'note', label: 'Outcome', type: 'textarea', required: true }, { key: 'next', label: 'Next follow-up date (reminder)', type: 'date', required: true }], { next: util.iso(util.addDays(CRM.TODAY, 3)) }, (v) => { db.update('amcOpportunities', o.id, { followups: (o.followups || []).concat([Object.assign({ at: now().toISOString(), by: me() }, v)]), status: o.status === 'Open' ? 'Under Follow-up' : o.status, nextFollowUp: v.next }, { note: 'Follow-up ' + v.mode }); re(); }); return false; } });
+      acts.push({ label: 'Log follow-up', onClick: () => { ui.formModal('Follow-up (call / visit)', [{ key: 'mode', label: 'Mode', type: 'select', options: ['Call', 'Visit', 'Email', 'WhatsApp'], required: true }, { key: 'note', label: 'Outcome', type: 'textarea', required: true }, { key: 'next', label: 'Next follow-up date (reminder)', type: 'date', required: true }], { next: util.iso(util.addDays(CRM.TODAY, 3)) }, (v) => { db.update('amcOpportunities', o.id, { followups: (o.followups || []).concat([Object.assign({ at: now().toISOString(), by: me() }, v)]), status: o.status === 'Open' ? 'Under Follow-up' : o.status, nextFollowUp: v.next }, { note: 'Follow-up ' + v.mode }); closeTasks(o.id, v.mode + ': ' + v.note); oppTask(db.get('amcOpportunities', o.id), v.next); re(); }); return false; } });
       acts.push({ label: q ? 'Revise quotation' : 'Create AMC quotation', cls: 'primary', onClick: () => { quoteForm(o); return false; } });
       if (q && q.status === 'Draft') acts.push({ label: 'Send via email', onClick: () => { db.update('amcOpportunities', o.id, { quote: Object.assign({}, q, { status: 'Sent', sentAt: now().toISOString() }), status: 'Quotation Sent' }, { note: 'AMC quotation emailed' }); CRM.notify({ to: ['pm_coordinator'], title: 'Email sent: AMC quotation ' + q.no, body: 'To ' + cust.email + ' · ' + fmt.money(q.amount), channel: 'Email', link: '#/amc/' + o.id, key: 'aq-sent-' + q.no + q.amount }); evaluateSoon(); re(); return false; } });
       if (q && q.status === 'Sent') acts.push({ label: 'Mark opened', onClick: () => { db.update('amcOpportunities', o.id, { quote: Object.assign({}, q, { status: 'Opened', openedAt: now().toISOString() }) }, { note: 'Quotation opened' }); re(); return false; } });
@@ -2370,7 +2486,7 @@
     ui.drawer({ title: o.id + ' · ' + o.type, sub: cust.name + ' · ' + o.division, actions: acts, body: h('div', { class: 'stack' }, [
       ui.stepper(OPP_STATUS.slice(0, 5), step, o.status === 'Lost'),
       o.status === 'Lost' ? txtCallout('Lost — ' + o.lostReason, 'bad') : null, contract ? htmlCallout('AMC contract <a href="#/amc/' + esc(contract.id) + '">' + esc(contract.id) + '</a> activated ' + fmt.date(contract.start) + ' → ' + fmt.date(contract.end), 'ok') : null,
-      ui.dl([['Opportunity ID', o.id], ['Customer', cust.name], ['Contact', cust.contact + ' · ' + cust.phone], ['Location', cust.area], ['Opportunity type', ui.badge(o.type, o.type === 'AMC Renewal' ? 'brand' : 'violet')], ['Trigger', o.trigger || 'Manual'], ['Product details', o.productDetails], ['Installed base', installedBase(o.assetIds)], ['Estimated AMC value', fmt.money(o.estValue)], ['Expected closure', fmt.date(o.expectedClose)], ['Assigned to', master.staffName(o.assignedTo)], ['Created by', master.staffName(o.createdBy)], ['Closed by', master.staffName(o.closedBy)], ['Renewal probability', ui.badge(oppScore(o) + '%', oppScore(o) >= 60 ? 'ok' : oppScore(o) >= 40 ? 'warn' : 'bad')], ['Incentive applicable', o.incentiveApplicable || (o.status === 'Won' ? 'Yes' : '—')], ['Next follow-up', fmt.date(o.nextFollowUp)]]),
+      ui.dl([['Opportunity ID', o.id], ['Follow-up task', ((t) => (t ? t.id + ' · due ' + fmt.date(t.dueDate) + ' · ' + master.staffName(t.assignedTo) : 'None open'))(db.one('serviceTasks', (t) => t.refId === o.id && t.status === 'Open'))], ['Customer', cust.name], ['Contact', cust.contact + ' · ' + cust.phone], ['Location', cust.area], ['Opportunity type', ui.badge(o.type, o.type === 'AMC Renewal' ? 'brand' : 'violet')], ['Trigger', o.trigger || 'Manual'], ['Product details', o.productDetails], ['Installed base', installedBase(o.assetIds)], ['Estimated AMC value', fmt.money(o.estValue)], ['Expected closure', fmt.date(o.expectedClose)], ['Assigned to', master.staffName(o.assignedTo)], ['Created by', master.staffName(o.createdBy)], ['Closed by', master.staffName(o.closedBy)], ['Renewal probability', ui.badge(oppScore(o) + '%', oppScore(o) >= 60 ? 'ok' : oppScore(o) >= 40 ? 'warn' : 'bad')], ['Incentive applicable', o.incentiveApplicable || (o.status === 'Won' ? 'Yes' : '—')], ['Next follow-up', fmt.date(o.nextFollowUp)]]),
       q ? ui.card('AMC quotation ' + q.no, ui.dl([['Template', q.template], ['AMC type', q.amcType], ['Capacity (kVA/kW)', q.capacity], ['Batteries', q.batteries], ['Amount', fmt.money(q.amount)], ['Discount', (q.discountPct || 0) + '% ' + (q.discountApproval ? '· ' + q.discountApproval : '')], ['Status', ui.badge(q.status)], ['Sent', fmt.dateTime(q.sentAt)]])) : txtCallout('No quotation yet — TAT: submit at least 30 days before expiry.', 'warn'),
       ui.card('Follow-ups', (o.followups || []).length ? ui.timeline(o.followups.slice().reverse().map((f) => ({ when: fmt.dateTime(f.at) + ' · ' + f.mode + ' · ' + master.staffName(f.by), title: f.note, body: 'Next: ' + fmt.date(f.next) }))) : ui.empty('No follow-ups yet')),
       ui.card('Audit trail', ui.auditTrail('amcOpportunities', o.id)),
@@ -2497,10 +2613,10 @@
     if (own && s === 0) acts.push({ label: 'Plan visit', cls: 'primary', onClick: () => { ui.formModal('Plan PM visit', [{ key: 'scheduledDate', label: 'Visit date', type: 'date', required: true }], { scheduledDate: v.dueDate }, (x) => { up({ scheduledDate: x.scheduledDate, stage: 1 }, 'Visit planned ' + fmt.date(parseD(x.scheduledDate))); re(); }); return false; } });
     if (own && s === 1) acts.push({ label: 'Customer confirmed', cls: 'primary', onClick: () => { up({ customerConfirmedAt: now().toISOString(), stage: 2 }, 'Customer confirmed visit'); CRM.notify({ to: ['pm_coordinator'], title: 'Customer reminder SMS sent: PM visit ' + fmt.date(v.scheduledDate), body: custName(v.customerId), channel: 'SMS', link: '#/pm/' + v.id, key: 'pm-sms-' + v.id }); re(); return false; } });
     if (roleIs('pm_coordinator', 'service_coordinator', 'admin') && s === 2) acts.push({ label: 'Assign engineer', cls: 'primary', onClick: () => { ui.formModal('Assign PM engineer', [{ key: 'engineerId', label: 'Engineer', type: 'select', options: staffOpts('service_engineer'), required: true }], { engineerId: v.engineerId }, (x) => { up({ engineerId: x.engineerId, stage: 3 }, 'Engineer assigned'); CRM.notify({ to: ['service_engineer'], title: 'PM visit assigned: ' + v.id, body: custName(v.customerId) + ' · ' + v.systemType + ' · ' + fmt.date(v.scheduledDate), link: '#/pm/' + v.id, key: 'pm-asg-' + v.id + x.engineerId }); re(); }); return false; } });
-    if (own && s === 3) acts.push({ label: 'Visit completed', cls: 'primary', onClick: () => { evModal('Visit completed — evidence', [{ key: 'visitAt', label: 'Visit date & time', type: 'datetime-local', required: true }], { visitAt: dtLocal(now()) }, [{ key: 'photosBefore', kind: 'photo', label: 'Before-service photos', required: true }, { key: 'photosAfter', kind: 'photo', label: 'After-service photos', required: true }, { key: 'signature', kind: 'signature', label: 'Customer signature', required: true, default: (master.customer(v.customerId) || {}).contact }], (x) => { up({ visitAt: new Date(x.visitAt).toISOString(), photosBefore: x.photosBefore, photosAfter: x.photosAfter, signature: x.signature, customerAck: true, stage: 4 }, 'Visit completed'); re(); }); return false; } });
+    if (own && s === 3) acts.push({ label: 'Visit completed', cls: 'primary', onClick: () => { evModal('Visit completed — evidence', [{ key: 'visitAt', label: 'Visit date & time', type: 'datetime-local', required: true }], { visitAt: dtLocal(now()) }, [{ key: 'photosBefore', kind: 'photo', label: 'Before-service photos', required: true }, { key: 'photosAfter', kind: 'photo', label: 'After-service photos', required: true }, { key: 'signature', kind: 'signature', label: 'Customer signature', required: true, default: (master.customer(v.customerId) || {}).contact }], (x) => { up({ visitAt: new Date(x.visitAt).toISOString(), photosBefore: storeEv(x.photosBefore, 'pmVisits', v.id, 'photosBefore', 'PM before-service photos'), photosAfter: storeEv(x.photosAfter, 'pmVisits', v.id, 'photosAfter', 'PM after-service photos'), signature: storeEv(x.signature, 'pmVisits', v.id, 'signature', 'PM customer signature'), customerAck: true, stage: 4 }, 'Visit completed'); re(); }); return false; } });
     if (own && s === 4) acts.push({ label: 'Submit checklist', cls: 'primary', onClick: () => {
       if (!cl.complete()) { ui.toast('Blocked: PM cannot be completed — ' + items.filter((i) => !state[i]).length + ' checklist item(s) incomplete', 'bad'); return false; }
-      if (!v.photosBefore || !v.photosAfter || !v.signature) { ui.toast('Blocked: photos and customer signature are mandatory', 'bad'); return false; }
+      if (!evOk(v, 'pmVisits', 'photosBefore') || !evOk(v, 'pmVisits', 'photosAfter') || !evOk(v, 'pmVisits', 'signature')) { ui.toast('Blocked: photos and customer signature are mandatory (stored attachments)', 'bad'); return false; }
       up({ checklist: state, checklistVersion: cfg().checklistVersion[v.systemType] || 'v1.0', completedDate: util.iso(v.visitAt || CRM.TODAY), stage: 5 }, 'Checklist submitted'); re(); return false;
     } });
     if (own && s === 5) acts.push({ label: 'Record findings', cls: 'primary', onClick: () => { ui.formModal('Findings & corrective actions', [{ key: 'findings', label: 'Findings', type: 'textarea', required: true }, { key: 'readings', label: 'Measurements / readings' }, { key: 'defects', label: 'Defects requiring corrective action (creates a separate service call)', type: 'checkbox' }], {}, (x) => {
@@ -3138,7 +3254,7 @@
     vs.filter((v) => !v.completedDate && !v.scheduledDate && util.daysBetween(CRM.TODAY, v.dueDate) >= 0 && util.daysBetween(CRM.TODAY, v.dueDate) <= 10).forEach((v) => tasks.push({ title: 'Plan PM ' + v.id + ' · ' + custName(v.customerId), sub: 'Due ' + fmt.date(v.dueDate) + ' — fix date & assign engineer', badge: ui.badge('Due', 'warn'), link: '#/pm/' + v.id }));
     vs.filter((v) => v.stage === 7 && !v.reportApproved).forEach((v) => tasks.push({ title: 'Approve PM report ' + v.id, sub: custName(v.customerId) + ' · ' + (v.findings || ''), badge: ui.badge('Approval', 'violet'), link: '#/pm/' + v.id }));
     opps.filter((o) => !o.quote).forEach((o) => tasks.push({ title: 'Send AMC quotation · ' + custName(o.customerId), sub: o.type + ' · ' + o.trigger + ' · ' + fmt.money(o.estValue), badge: ui.badge('No quote', 'bad'), link: '#/amc/' + o.id }));
-    opps.filter((o) => o.nextFollowUp && o.nextFollowUp <= util.iso(CRM.TODAY)).forEach((o) => tasks.push({ title: 'Follow up ' + o.id + ' · ' + custName(o.customerId), sub: 'Reminder due ' + fmt.date(o.nextFollowUp), badge: ui.badge('Follow-up', 'info'), link: '#/amc/' + o.id }));
+    db.find('serviceTasks', (t) => t.status === 'Open' && t.dueDate <= util.iso(CRM.TODAY)).forEach((t) => tasks.push({ title: t.title, sub: t.id + ' · due ' + fmt.date(t.dueDate) + ' · ' + master.staffName(t.assignedTo), badge: ui.badge(t.dueDate < util.iso(CRM.TODAY) ? 'Overdue' : 'Due today', t.dueDate < util.iso(CRM.TODAY) ? 'bad' : 'info'), link: t.link }));
     const ms = months(6);
     el.appendChild(h('div', { class: 'grid g3' }, [
       h('div', { class: 'span2' }, ui.card('Today’s tasks (' + tasks.length + ')', taskList(tasks))),
@@ -3220,7 +3336,7 @@
   let booted = false;
   let popupReady = false; let lastPop = 0; let popQueue = 0;
   function tick() { if (!booted) return; safe(() => { runSlaAlerts(); evaluatePolicies(); }, null); }
-  CRM.on('ready', () => { safe(() => { cfg(); runAutomation(); }, null); booted = true; setTimeout(() => { popupReady = true; }, 1500); });
+  CRM.on('ready', () => { safe(() => { cfg(); runAutomation(); }, null); safe(() => db.find('amcOpportunities', (o) => !['Won', 'Lost'].includes(o.status) && !db.one('serviceTasks', (t) => t.refId === o.id && t.status === 'Open')).forEach((o) => oppTask(o, o.nextFollowUp || util.iso(util.addDays(parseD(o.createdAt || CRM.TODAY), FOLLOW_UP_DAYS)), { silent: true })), null); booted = true; setTimeout(() => { popupReady = true; }, 1500); });
   if (CRM.registerTick) safe(() => CRM.registerTick(tick, 60e3), null); else setInterval(tick, 60e3);
   // popup for new critical notifications addressed to the current user's role (bell badge alone is easy to miss)
   CRM.on('notifications:created', (n) => {

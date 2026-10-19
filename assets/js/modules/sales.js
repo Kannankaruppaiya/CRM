@@ -22,7 +22,8 @@
   const CHANNELS = ['OTS', 'Office Walk-in', 'Upselling & Cross Selling', 'Cold Calling', 'Digital Marketing', 'Referral Sales', 'Advertisements', 'Business Forums'];
   const EXISTING_CHANNELS = ['OTS', 'Office Walk-in', 'Upselling & Cross Selling'];
   const REFERRAL_TYPES = ['Vendor reference', 'Existing customer reference', 'Dealer reference', 'Staff reference'];
-  const LEAD_SOURCES = ['Cold Calling', 'Existing Customer Reference', 'Existing Customer Business', 'Dealer', 'Website', 'Walk-in', 'Campaign'];
+  // Lead sources and payment terms come from the core Master Data lists (same array identity, so admin edits apply live)
+  const LEAD_SOURCES = (CRM.master && Array.isArray(CRM.master.leadSources)) ? CRM.master.leadSources : ['Cold Calling', 'Existing Customer Reference', 'Existing Customer Business', 'Dealer', 'Website', 'Walk-in', 'Campaign'];
   const CUSTOMER_TYPES = ['New Customer', 'Existing Customer', 'Dealer', 'Key Customer'];
   const CALL_STATUS = ['Connected', 'Call Back Requested', 'Not Reachable', 'Busy', 'Switched Off', 'Wrong Number', 'Not Interested'];
   const FU_STATUS = ['Pending', 'Completed', 'Missed', 'Rescheduled'];
@@ -30,7 +31,14 @@
   const QUOTE_STATUS = ['Sent', 'Under Discussion', 'Approved', 'Rejected', 'Pending'];
   const LOST_REASONS = ['Price too high', 'Lost to competitor', 'Budget not available', 'Decision postponed', 'Product / spec mismatch', 'No response from customer', 'Other'];
   const MATERIAL = ['Available in stock', 'Partially available', 'To be procured', 'Ordered with vendor'];
-  const PAY_TERMS = { '100% Advance': 0, 'Against delivery': 0, 'Credit 15 days': 15, 'Credit 30 days': 30, 'Credit 45 days': 45, 'Credit 60 days': 60 };
+  const PAY_TERMS_DEFAULT = { '100% Advance': 0, 'Against delivery': 0, 'Credit 15 days': 15, 'Credit 30 days': 30, 'Credit 45 days': 45, 'Credit 60 days': 60 };
+  // { termName: creditDays } view over CRM.master.paymentTerms ([{name, days}]); Object.keys / lookups always reflect Master Data
+  const PAY_TERMS = (CRM.master && Array.isArray(CRM.master.paymentTerms) && typeof Proxy === 'function') ? new Proxy({}, {
+    get: (t, k) => { if (typeof k !== 'string') return undefined; const x = CRM.master.paymentTerms.find((p) => p.name === k); return x ? Number(x.days) || 0 : undefined; },
+    has: (t, k) => CRM.master.paymentTerms.some((p) => p.name === k),
+    ownKeys: () => CRM.master.paymentTerms.map((p) => p.name),
+    getOwnPropertyDescriptor: (t, k) => { const x = CRM.master.paymentTerms.find((p) => p.name === k); return x ? { value: Number(x.days) || 0, enumerable: true, configurable: true, writable: false } : undefined; },
+  }) : PAY_TERMS_DEFAULT;
   const PAY_MODES = ['Cash', 'UPI', 'NEFT / RTGS', 'Cheque', 'Card'];
   const WARRANTY = ['Standard warranty – 12 months', 'Extended warranty – 24 months', 'Battery warranty – 36 months (pro-rata)', 'Comprehensive AMC – 1 year', 'Non-comprehensive AMC – 1 year', 'Solar system warranty – 5 years (panels 25 yrs perf.)'];
   const SCRAP_TYPES = ['Battery', 'Inverter', 'UPS'];
@@ -1513,19 +1521,11 @@
     if (params && params[0]) { const o = db.get('orders', params[0]); if (o && (!isExec() || o.execId === me())) setTimeout(() => orderDrawer(o), 30); }
   }
   const linkedProject = (o) => db.all('projects').find((p) => p.orderId === o.id || (o.soNumber && p.soNumber === o.soNumber));
-  // Read-only view of the project's current stage for Sales (projects.js owns the workflow; CRM.projects.stageInfo preferred when exposed)
-  const PRJ_WF = {
-    es_large: [['so', 'SO receipt'], ['survey', 'Site survey'], ['boq', 'BOQ'], ['procurement', 'Procurement'], ['delivery', 'Material delivery'], ['planning', 'Installation planning'], ['cable', 'Cable laying'], ['nvr', 'DVR / NVR'], ['cameras', 'Camera installation'], ['testing', 'Config / Testing / Commissioning'], ['handover', 'Handover / Closure']],
-    es_small: [['so', 'SO received & job created'], ['scope', 'Scope & site verified'], ['survey', 'Site visit (if required)'], ['boq', 'BOQ / material list'], ['procurement', 'Stock & purchase'], ['delivery', 'Material issued & scheduled'], ['install', 'Cable & device installation'], ['testing', 'DVR/NVR config & testing'], ['handover', 'Demo & handover'], ['activate', 'Asset / warranty / PM activation']],
-    solar: [['so', 'SO receipt'], ['survey', 'Site visit & feasibility'], ['boq', 'BOQ'], ['procurement', 'Purchase & material planning'], ['delivery', 'Dispatch & site verification'], ['planning', 'Installation planning'], ['civil', 'Civil work'], ['mechanical', 'Mechanical installation'], ['electrical', 'Electrical installation'], ['commissioning', 'Testing & commissioning'], ['compliance', 'Net metering & subsidy'], ['handover', 'Customer handover']],
-    es_pending: [['so', 'SO receipt / classification']],
-  };
+  // Read-only view of the project's current stage for Sales — projects.js owns the workflow (CRM.projects.stageInfo)
   function projectStage(p) {
-    if (CRM.projects && typeof CRM.projects.stageInfo === 'function') { try { const x = CRM.projects.stageInfo(p); if (x && x.label) return x; } catch (err) { /* fall back */ } }
-    const wf = PRJ_WF[p.kind] || [];
-    const i = wf.findIndex(([k]) => { const x = (p.stages || {})[k]; return !(x && (x.status === 'Completed' || x.status === 'Skipped')); });
-    const idx = i < 0 ? wf.length : i;
-    return { label: ['Closed', 'Cancelled'].includes(p.status) ? p.status : i < 0 ? 'All stages complete' : wf[i][1], pct: wf.length ? Math.round(idx / wf.length * 100) : 0, step: Math.min(idx + 1, wf.length), steps: wf.length };
+    const x = CRM.projects && typeof CRM.projects.stageInfo === 'function' ? (() => { try { return CRM.projects.stageInfo(p); } catch (err) { return null; } })() : null;
+    if (!x) return { label: p.status || '—', pct: null, step: 0, steps: 0 };
+    return { label: p.status === 'Cancelled' ? 'Cancelled' : x.stageLabel, pct: x.pct, step: x.step, steps: x.totalSteps };
   }
   function projectCell(o) {
     const p = linkedProject(o);
@@ -2684,6 +2684,22 @@
     CRM.emit('invoice.raised', { invoice: inv });
     send(['accounts'], { title: 'Service charges to collect: ' + fmt.money(p.amount), body: (cust.name || '') + ' · complaint ' + (c.id || ''), link: '#/invoices', severity: 'info', key: 'srvinv:' + (c.id || inv.id) });
   });
+  // Service installation record (Power SO) → SO installation status, completion date and scrap collection
+  // Payload: { orderId, complaintId, status?, installedAt?/completedAt?, payment, scrapCollected, scrapId, dcRef, invoiceRef }
+  function syncInstallation(p, completed) {
+    const o = p && p.orderId && db.get('orders', p.orderId);
+    if (!o) return;
+    const doneAt = p.completedAt || p.installedAt || null;
+    const st = completed || doneAt || ['Completed', 'Closed'].includes(p.status) ? 'Completed' : p.status === 'In Progress' ? 'In Progress' : p.status === 'Assigned' ? 'Scheduled' : null;
+    const patch = {};
+    if (st && st !== o.installationStatus && !(o.installationStatus === 'Completed' && st !== 'Completed')) patch.installationStatus = st;
+    if (doneAt && !o.installationCompletionDate) { patch.installationCompletionDate = util.iso(doneAt); if (!o.deliveredDate) patch.deliveredDate = util.iso(doneAt); }
+    if (p.scrapCollected && o.scrapApplicable && !o.scrapCollected) patch.scrapCollected = true;
+    if (p.complaintId && o.installationCallId !== p.complaintId) patch.installationCallId = p.complaintId;
+    if (Object.keys(patch).length) db.update('orders', o.id, patch, { note: 'Installation record ' + (p.complaintId || '') + ' synced from Service' });
+  }
+  CRM.on('installation.updated', (p) => syncInstallation(p, false));
+  CRM.on('installation.completed', (p) => syncInstallation(p, true));
   // Sales OTS (battery qty > 2) from Service → Sales Coordinator assigns to an executive
   // Payload: { ots } with service.js field names (qty, value, brand, productType, capacity, contact, customerId, urgency, complaintId)
   CRM.on('ots.created', (p) => {
