@@ -42,7 +42,7 @@
     el.appendChild(ui.kpis([
       { label: 'Pipeline value', value: s ? fmt.lakh(s.pipelineValue) : '—', meta: s ? s.enquiries + ' enquiries' : '', color: 'var(--chart-1)', onClick: () => CRM.canSee('pipeline') && CRM.go('pipeline') },
       { label: 'Orders won', value: s ? fmt.lakh(s.wonValue) : '—', meta: s ? s.wonCount + ' orders' : '', color: 'var(--ok)' },
-      { label: 'Outstanding', value: s ? fmt.lakh(s.outstanding) : '—', meta: s ? 'Collected this month ' + fmt.lakh(s.collectedThisMonth) : '', color: 'var(--warn)', tone: 'down' },
+      { label: 'Outstanding', value: s ? fmt.lakh(s.outstanding) : '—', meta: s ? 'Collected this month ' + fmt.lakh(s.collectedThisMonth) : '', color: 'var(--warn)' },
       { label: 'Active projects', value: p ? p.active : '—', meta: p ? p.overdue + ' overdue · ' + p.materialShort + ' material short' : '', color: 'var(--div-security)' },
       { label: 'Open service calls', value: v ? v.openCalls : '—', meta: v ? v.overdueCalls + ' overdue' : '', color: 'var(--violet)' },
       { label: 'Attendance SLA', value: v ? fmt.pct(v.attendanceSla) : '—', meta: v ? 'Resolution SLA ' + fmt.pct(v.resolutionSla) : '', color: 'var(--info)' },

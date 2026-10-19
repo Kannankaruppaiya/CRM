@@ -25,8 +25,8 @@ Scoping rules: a Sales Executive sees only their own leads; a Vendor sees only t
 | Module | Collections |
 |---|---|
 | sales | `enquiries`, `quotations`, `orders`, `invoices`, `payments`, `followups`, `dealers`, `upsells`, `targets`, `callLogs`, `checkins` |
-| projects | `projects` (ES large/small + Solar), `surveys`, `boqs`, `purchaseRequests`, `purchaseOrders`, `grns`, `stock`, `dcs`, `scrap`, `netMetering`, `subsidies` |
-| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests` |
+| projects | `projects` (ES large/small + Solar), `surveys`, `boqs`, `purchaseRequests`, `purchaseOrders`, `grns`, `stock`, `dcs`, `scrap`, `netMetering`, `subsidies`, `credVault` (references and access audit only, never secrets) |
+| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests`, `ots`, `amcOpportunities`, `serviceConfig` |
 
 A module reads other modules' collections but never writes them directly. Cross-module handoffs go through the event bus instead.
 
@@ -37,6 +37,7 @@ A module reads other modules' collections but never writes them directly. Cross-
 | `project.handover` | projects | `{ project, equipment:[{productId,name,serial,location,channel}] }` | service creates `assets`, activates warranty/PM and notifies the PM coordinator |
 | `invoice.raised` | sales | `{ invoice }` | — (dashboards) |
 | `complaint.chargeable` | service | `{ complaint, amount }` | sales/accounts may show service charges to collect |
+| `ots.created` | service | `{ ots }` (Sales OTS: more than 2 batteries) | sales queues it for the Sales OTS desk |
 | `violation.raise` | any | `{ division, type, policyRef, owner, severity, recordId, link, details }` | service (ODM desk) creates the `violations` record |
 
 ## Core API cheat-sheet
