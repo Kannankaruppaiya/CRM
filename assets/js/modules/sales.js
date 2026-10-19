@@ -1,8 +1,13 @@
 /* Sales CRM module — Maruthi Power Control Systems
  * Source: Sales.pdf (plus Sales OTS flow and Sales/Installation policy violations from Service_requirement.pdf)
  * Owns collections: enquiries, quotations, orders, invoices, payments, followups, dealers, upsells, targets, callLogs, checkins
- * Emits:  order.won (on Sales Manager SO approval), invoice.raised, violation.raise (sales SLA breaches)
- * Listens: complaint.chargeable (service charges to collect), ots.created (Sales OTS → coordinator queue, optional)
+ * Emits:  order.won (on Sales Manager SO approval), invoice.raised, violation.raise (sales SLA breaches),
+ *         ots.converted { otsId, enquiryId, execId } (Sales OTS taken into the sales pipeline),
+ *         ots.outcome { otsId, enquiryId, status: 'Quotation Sent'|'Negotiation'|'Won'|'Lost', revenue, orderId, closedBy, lostReason }
+ *         (Sales never writes the Service-owned `ots` collection — Service listens and updates the OTS record)
+ * Listens: complaint.chargeable (service charges to collect), ots.created (Sales OTS → coordinator queue / Sales OTS desk)
+ * Config:  CRM.config keys 'gst.<Division>', 'sales.sla', 'sales.escalation', 'sales.paymentEscalation', 'sales.reminders',
+ *          'sales.discount', 'sales.otsIncentive' (Settings & Rules → "Sales rules & reports"); fallback store: salesConfig/CFG
  */
 (function () {
   'use strict';
@@ -33,7 +38,9 @@
   const CALL_OUTCOMES = ['Interested', 'Enquiry Generated', 'Call Back Later', 'Not Interested', 'Not Reachable'];
   const UPSELL_STATUS = ['Suggested', 'Offered', 'Converted', 'Declined'];
   const ORDER_STEPS = ['Order Won', 'SO Approved', 'Invoiced', 'Delivered / Installed', 'Payment Received'];
-  const SLA = { quoteHrs: 24, siteVisitHrs: 24, soHrs: 24, scrapHrs: 24, quoteResponseDays: 3 };
+  // Sales policy SLAs (Service_requirement §4–5) — configurable in Settings & Rules (see cfg('sales.sla'))
+  const SLA = {};
+  ['quoteHrs', 'siteVisitHrs', 'soHrs', 'scrapHrs', 'quoteResponseDays'].forEach((k) => Object.defineProperty(SLA, k, { get: () => Number(cfg('sales.sla')[k]) || 0 }));
   // Upsell / cross-sell suggestion rules (e.g. customer buying UPS → offer batteries / stabilizer)
   const UPSELL_RULES = [
     { when: 'Online UPS', type: 'Cross-sell', offer: 'Battery', why: 'UPS needs a battery bank' },
@@ -67,11 +74,20 @@
   const allOrders = () => scope(db.all('orders'));
   const allInvoices = () => scope(db.all('invoices'));
   const custName = (r) => { const c = r.customerId && master.customer(r.customerId); return c ? c.name : (r.accountName || '—'); };
+  // trusted markup (all user text passes through util.esc) — Core v2 ui.callout escapes, ui.calloutHtml renders markup
+  const calloutH = (html, tone) => (ui.calloutHtml ? ui.calloutHtml(html, tone) : ui.callout(html, tone));
   const mono = (t) => h('span', { class: 'mono' }, t || '—');
   const lnk = (route, id) => h('a', { class: 'mono', href: '#/' + route + '/' + id }, id);
   const monthKey = (d) => util.iso(d).slice(0, 7);
-  const monthLabel = (k) => new Date(k + '-01T00:00:00').toLocaleDateString('en-IN', { month: 'short', year: '2-digit' });
-  const enqMonth = (d) => new Date(d).toLocaleDateString('en-IN', { month: 'short', year: 'numeric' });
+  // Display formats come from CRM.fmt ("25 Oct 2026", "Oct 2026", "10:30 AM"); local fallbacks use fixed month names (no locale "Sept")
+  const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const WDAY = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const parseD = (v) => { if (v instanceof Date) return new Date(v); if (util.parseDate) { const x = util.parseDate(v); if (x) return x; } const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v || '')); return m ? new Date(+m[1], +m[2] - 1, +m[3]) : new Date(v); };
+  const monthText = (d) => { const x = parseD(d); if (isNaN(x)) return '—'; return fmt.month ? fmt.month(x) : MON[x.getMonth()] + ' ' + x.getFullYear(); };
+  const timeText = (d) => { if (!d) return '—'; const x = new Date(d); if (isNaN(x)) return '—'; if (fmt.time) return fmt.time(x); const hr = x.getHours(); return (hr % 12 || 12) + ':' + String(x.getMinutes()).padStart(2, '0') + ' ' + (hr >= 12 ? 'PM' : 'AM'); };
+  const dayLabel = (d) => { const x = parseD(d); return WDAY[x.getDay()] + ' ' + x.getDate() + ' ' + MON[x.getMonth()]; };
+  const monthLabel = (k) => monthText(k + '-01');
+  const enqMonth = (d) => monthText(new Date(d));
   const inRange = (d, from, to) => { if (!d) return false; const x = util.iso(d); return x >= from && x <= to; };
   const hrsText = (n) => (n == null || isNaN(n) ? '—' : n < 48 ? (Math.round(n * 10) / 10) + ' h' : (Math.round(n / 24 * 10) / 10) + ' d');
   const stageTone = (s) => (s === 'Order Won' ? 'ok' : s === 'Order Lost' ? 'bad' : s === 'Negotiation' ? 'warn' : s === 'Enquiry Received' ? 'brand' : 'info');
@@ -82,12 +98,71 @@
   const monthsBack = (n) => { const out = []; for (let i = n - 1; i >= 0; i--) { const d = new Date(CRM.TODAY); d.setDate(1); d.setMonth(d.getMonth() - i); out.push(monthKey(d)); } return out; };
   const monthRange = (k) => { const s = new Date(k + '-01T00:00:00'); const e = new Date(s); e.setMonth(e.getMonth() + 1); e.setDate(0); return [util.iso(s), util.iso(e)]; };
   const categories = (div) => [...new Set(master.products(div).map((p) => p.category))];
+  // calendar week (Mon → Sun) containing d
+  const weekRange = (d) => { const x = parseD(d); x.setHours(0, 0, 0, 0); const s = util.addDays(x, -((x.getDay() + 6) % 7)); return [util.iso(s), util.iso(util.addDays(s, 6))]; };
+
+  // ---------- configuration (Core API v2 CRM.config with defaults; fallback: salesConfig/CFG record)
+  const DEFAULT_GST = { Power: 18, 'Electronic Security': 18, Solar: 12 };
+  const SALES_CFG = {
+    'sales.sla': { quoteHrs: 24, siteVisitHrs: 24, soHrs: 24, scrapHrs: 24, quoteResponseDays: 3 },
+    'sales.escalation': { l2: 6, l3: 12, l4: 24 }, // hours after SLA breach: L2 coordinator, L3 sales head, L4 management (Service_requirement §14)
+    'sales.paymentEscalation': { l2: 7, l3: 15, l4: 30 }, // days overdue beyond credit policy
+    'sales.reminders': { paymentDueDays: 3, scanMinutes: 5 },
+    'sales.discount': { justifyAbovePct: 10 },
+    'sales.otsIncentive': { salesPct: null, engineerSharePct: 50 }, // salesPct blank = Service OTS configuration
+  };
+  function cfg(key) {
+    const d = SALES_CFG[key];
+    let v = null;
+    try { v = CRM.config && CRM.config.get ? CRM.config.get(key, d) : (db.get('salesConfig', 'CFG') || {})[key]; } catch (e) { v = null; }
+    return d && typeof d === 'object' ? Object.assign({}, d, v && typeof v === 'object' ? v : {}) : (v == null ? d : v);
+  }
+  function setCfg(key, val) {
+    if (CRM.config && CRM.config.set) { CRM.config.set(key, val); return; }
+    if (db.get('salesConfig', 'CFG')) db.update('salesConfig', 'CFG', { [key]: val }, { note: 'Sales settings · ' + key });
+    else db.insert('salesConfig', { id: 'CFG', [key]: val }, { note: 'Sales settings · ' + key });
+  }
+  /** GST % per division — core built-in config 'gst.<Division>' (fallback Power / ES 18 %, Solar 12 %). */
+  function gstPct(div) {
+    const d = DEFAULT_GST[div] != null ? DEFAULT_GST[div] : 18;
+    let v = d;
+    try { if (CRM.config && CRM.config.get) v = CRM.config.get('gst.' + div, d); } catch (e) { v = d; }
+    v = Number(v);
+    return v >= 0 && v < 100 ? v : d;
+  }
+  const withGst = (value, div) => Math.round((Number(value) || 0) * (1 + gstPct(div) / 100));
+  const exGst = (value, div) => Math.round((Number(value) || 0) / (1 + gstPct(div) / 100));
+
+  // ---------- notifications: per-person recipients (Core v2 toUser) and links the recipient's role can open
+  const PAGE_ROLES = {};
+  function canOpen(link, roleId) {
+    const id = String(link || '').replace(/^#\/?/, '').split('/')[0];
+    if (!id) return true;
+    if (PAGE_ROLES[id]) return PAGE_ROLES[id].includes(roleId);
+    if (CRM.canSee && CRM.canSee.length >= 2) { try { return !!CRM.canSee(id, roleId); } catch (e) { return true; } }
+    return true;
+  }
+  /** Notify roles; each role gets the first link it can open (links: candidates in order of preference). */
+  // notification event (drives Email / WhatsApp channel settings in Core v2) inferred from the key prefix
+  const EVENT_OF = { assign: 'assignment', assignc: 'assignment', unassigned: 'assignment', ots: 'assignment', qappr: 'approval', soappr: 'approval', pol: 'escalation', paydue: 'payment', payv: 'payment', inv: 'payment', toinv: 'payment', srvinv: 'payment', fudue: 'sla', fumiss: 'sla', fumissc: 'sla', qresp: 'sla' };
+  function send(roles, n, links) {
+    n = Object.assign({ event: EVENT_OF[String(n.key || '').split(':')[0]] || 'general' }, n);
+    links = [].concat(links || n.link || []).filter(Boolean);
+    const groups = {}, order = [];
+    [].concat(roles).forEach((r) => { const l = links.find((x) => canOpen(x, r)) || ''; if (!groups[l]) { groups[l] = []; order.push(l); } groups[l].push(r); });
+    order.forEach((l, i) => CRM.notify(Object.assign({}, n, { to: groups[l], link: l, key: n.key && order.length > 1 ? n.key + ':' + i : n.key })));
+  }
+  /** Person-specific notification (an executive's own lead / quote / order) — never broadcast to every executive. */
+  const sendUser = (userId, roles, n, links) => send(roles, Object.assign({}, n, userId ? { toUser: userId, key: n.key ? n.key + ':' + userId : n.key } : {}), links);
 
   // ---------- receivables
   const paymentsOf = (inv) => db.find('payments', (p) => p.invoiceId === inv.id);
-  const paidOf = (inv) => sum(paymentsOf(inv), 'value');
+  // Only receipts verified by Accounts reduce the outstanding; field updates stay "pending verification" until then
+  const paidOf = (inv) => sum(paymentsOf(inv).filter((p) => p.verified !== false), 'value');
+  const pendingOf = (inv) => sum(paymentsOf(inv).filter((p) => p.verified === false), 'value');
   const outstandingOf = (inv) => Math.max(0, Math.round((Number(inv.value) || 0) - paidOf(inv)));
-  const overdueDays = (inv) => (inv.dueDate ? util.daysBetween(inv.dueDate, CRM.TODAY) : 0);
+  const collectableOf = (inv) => Math.max(0, outstandingOf(inv) - Math.round(pendingOf(inv)));
+  const overdueDays = (inv) => (inv.dueDate ? util.daysBetween(parseD(util.iso(inv.dueDate)), CRM.TODAY) : 0);
   function invStatus(inv) {
     const o = outstandingOf(inv);
     if (o <= 0) return 'Paid';
@@ -226,17 +301,21 @@
       isNewCustomer: !cust || cust.type === 'New Customer', siteVisitRequired: v.siteVisitRequired != null ? !!v.siteVisitRequired : v.division !== 'Power',
       stageHistory: [{ stage: opts.stage || 'Enquiry Received', at: created, by: CRM.user().name, note: 'Enquiry created via ' + (v.salesChannel || 'CRM') }],
     }), { prefix: 'ENQ', note: 'Enquiry created' + (rule ? ' · ' + rule : '') });
+    if (e.otsId) CRM.emit('ots.converted', { otsId: e.otsId, enquiryId: e.id, execId: e.execId || '' });
     if (opts.quiet) return e;
     if (v.nextFollowUp) scheduleFollowUp(e, v.nextFollowUp, 'Call', 'First contact with customer', true);
-    if (execId) CRM.notify({ to: ['sales_exec', 'sales_coordinator'], title: 'Lead ' + e.id + ' assigned to ' + execName(execId), body: e.accountName + ' · ' + e.division + ' · ' + e.product + ' (' + rule + ')', link: '#/enquiries/' + e.id, severity: 'info', key: 'assign:' + e.id + ':' + execId });
-    else CRM.notify({ to: ['sales_coordinator', 'sales_manager'], title: 'Lead awaiting assignment: ' + e.id, body: e.accountName + ' · ' + e.division, link: '#/enquiries', severity: 'warn', key: 'unassigned:' + e.id });
+    if (execId) {
+      if (execId !== me()) sendUser(execId, ['sales_exec'], { title: 'New lead ' + e.id + ' assigned to you', body: e.accountName + ' · ' + e.division + ' · ' + e.product + ' (' + rule + ')', link: '#/enquiries/' + e.id, severity: 'info', key: 'assign:' + e.id + ':' + execId });
+      send(['sales_coordinator'], { title: 'Lead ' + e.id + ' assigned to ' + execName(execId), body: e.accountName + ' · ' + e.division + ' · ' + e.product + ' (' + rule + ')', link: '#/enquiries/' + e.id, severity: 'info', key: 'assignc:' + e.id + ':' + execId });
+    } else send(['sales_coordinator', 'sales_manager'], { title: 'Lead awaiting assignment: ' + e.id, body: e.accountName + ' · ' + e.division, link: '#/enquiries', severity: 'warn', key: 'unassigned:' + e.id });
     return e;
   }
 
   function assignEnquiry(e, execId, rule) {
     db.update('enquiries', e.id, { execId, assignRule: rule || 'Manual assignment by ' + CRM.role().name, assignedAt: nowIso(), assignedBy: CRM.user().name }, { note: 'Assigned to ' + execName(execId) });
     db.find('followups', (f) => f.enquiryId === e.id && f.status === 'Planned').forEach((f) => db.update('followups', f.id, { execId }, { silent: true }));
-    CRM.notify({ to: ['sales_exec'], title: 'Lead ' + e.id + ' assigned to ' + execName(execId), body: e.accountName + ' · ' + e.product, link: '#/enquiries/' + e.id, key: 'assign:' + e.id + ':' + execId });
+    sendUser(execId, ['sales_exec'], { title: 'Lead ' + e.id + ' assigned to you', body: e.accountName + ' · ' + e.product + (e.otsId ? ' · Sales OTS ' + e.otsId : ''), link: '#/enquiries/' + e.id, key: 'assign:' + e.id + ':' + execId });
+    if (e.otsId) CRM.emit('ots.converted', { otsId: e.otsId, enquiryId: e.id, execId });
   }
 
   function scheduleFollowUp(e, due, type, purpose, silent) {
@@ -249,17 +328,28 @@
     if (e.stage === 'Order Won') return 'Order already won — further changes go through the Sales Order (' + ((orderOf(e.id) || {}).id || 'SO') + ').';
     if (e.stage === 'Order Lost' && !isMgr()) return 'Only the Sales Manager can reopen a lost enquiry.';
     if (!e.execId) return 'Assign a Sales Executive before progressing this lead.';
-    const q = sentQuote(e.id);
+    const q = sentQuote(e.id) || (e.stage === 'Order Lost' ? lostQuote(e.id) : null);
     if ((to === 'Quotation Sent' || to === 'Negotiation') && !q) return 'Gate: a quotation approved by the Sales Manager must be sent before moving to "' + to + '".';
     if (to === 'Order Won' && !q) return 'Gate: Order Won needs a sent quotation (Sales Manager approved).';
     if (to === 'Site Visit Completed' && !e.siteVisitDate && STAGES.indexOf(e.stage) < 2) return null; // date captured in the modal
     return null;
   }
 
+  // the quotation that was marked Rejected when the enquiry was lost — restored when the Sales Manager reopens the lead
+  const lostQuote = (enqId) => quotesOf(enqId).filter((q) => q.quoteDate && q.status === 'Rejected' && q.approval === 'Approved').sort((a, b) => (a.quoteDate < b.quoteDate ? 1 : -1))[0] || null;
+  const otsStatusFor = (stage) => ({ 'Quotation Sent': 'Quotation Sent', Negotiation: 'Negotiation', 'Order Won': 'Won', 'Order Lost': 'Lost' }[stage] || '');
+  function otsOutcome(e, stage, extra) {
+    const status = otsStatusFor(stage);
+    if (!e || !e.otsId || !status) return;
+    const x = Object.assign({ otsId: e.otsId, enquiryId: e.id, status, closedBy: e.execId || '', by: e.execId || '', at: nowIso() }, extra || {});
+    if (x.lostReason) x.reason = x.lostReason; // service.js reads p.reason / p.by
+    CRM.emit('ots.outcome', x);
+  }
   function moveStage(e, to, onDone) {
     const err = stageGate(e, to);
     if (err) { ui.toast(err, 'bad'); return; }
-    const q = sentQuote(e.id);
+    const reopening = e.stage === 'Order Lost';
+    const q = sentQuote(e.id) || (reopening ? lostQuote(e.id) : null);
     const tomorrow = util.iso(util.addDays(CRM.TODAY, 1));
     const fields = [
       { type: 'section', label: e.stage + ' → ' + to },
@@ -297,6 +387,8 @@
       if (v.nextFollowUp) patch.nextFollowUp = v.nextFollowUp;
       if (to === 'Order Lost') Object.assign(patch, { lostReason: v.lostReason, competitor: v.competitor, lostDetails: v.lostDetails, closedAt: at, nextFollowUp: '' });
       if (to === 'Order Won') Object.assign(patch, { wonDetails: v.wonDetails, closedAt: at, nextFollowUp: '' });
+      if (reopening) Object.assign(patch, { closedAt: '', reopenedAt: at, reopenedBy: CRM.user().name, followUpStatus: 'Pending' });
+      if (reopening && q && q.status === 'Rejected') db.update('quotations', q.id, { status: to === 'Negotiation' ? 'Under Discussion' : 'Sent', customerRemarks: '' }, { note: 'Quotation restored — enquiry reopened by Sales Manager' });
       // close open follow-ups of this enquiry and schedule the next one
       db.find('followups', (f) => f.enquiryId === e.id && f.status === 'Planned').forEach((f) => db.update('followups', f.id, { status: 'Completed', completedAt: at, outcome: 'Stage moved to ' + to }, { silent: true }));
       db.update('enquiries', e.id, patch, { note: 'Stage ' + e.stage + ' → ' + to });
@@ -304,34 +396,39 @@
       if (to === 'Order Won') createOrderFromWin(db.get('enquiries', e.id), v, q);
       if (to === 'Order Lost' && q && q.status !== 'Rejected') db.update('quotations', q.id, { status: 'Rejected', customerRemarks: v.lostReason }, { note: 'Quotation rejected (order lost)' });
       if (to === 'Negotiation' && q && q.status === 'Sent') db.update('quotations', q.id, { status: 'Under Discussion' }, { note: 'Under discussion' });
+      if (to === 'Order Lost') otsOutcome(e, to, { lostReason: v.lostReason });
+      else if (to !== 'Order Won') otsOutcome(e, to, { quoteId: q ? q.id : '', reopened: reopening || undefined });
       ui.toast(e.id + ' moved to ' + to, to === 'Order Lost' ? 'warn' : 'ok');
       (onDone || CRM.refresh)();
     }, { sub: e.accountName + ' · ' + e.product, saveLabel: 'Move to ' + to });
   }
 
   // ============================================================ quotations
-  function computeQuote(lines, discountPct, scrapValue) {
+  /** Basic value, GST (per-division rate from configuration) and quote value net of scrap buy-back. */
+  function computeQuote(lines, discountPct, scrapValue, division) {
     const gross = sum(lines, (l) => (Number(l.qty) || 0) * (Number(l.rate) || 0));
     const basicValue = Math.round(gross * (1 - (Number(discountPct) || 0) / 100));
-    const gst = Math.round(basicValue * 0.18);
-    return { gross, basicValue, gst, quoteValue: basicValue + gst - (Number(scrapValue) || 0) };
+    const gstRate = gstPct(division);
+    const gst = Math.round(basicValue * gstRate / 100);
+    return { gross, basicValue, gstPct: gstRate, gst, quoteValue: basicValue + gst - (Number(scrapValue) || 0) };
   }
+  const quoteGstPct = (q) => (q && q.gstPct != null ? q.gstPct : gstPct(q && q.division));
   function submitQuote(q) {
     // Sales Manager approves every quotation before it is given to the customer
     if (isMgr()) { approveQuote(q, 'Self-approved by Sales Manager'); return; }
-    CRM.notify({ to: ['sales_manager'], title: 'Quotation ' + q.id + ' awaiting your approval', body: q.accountName + ' · ' + fmt.money(q.quoteValue) + (q.discountPct > 5 ? ' · discount ' + q.discountPct + '%' : ''), link: '#/quotations/' + q.id, severity: 'warn', key: 'qappr:' + q.id + ':' + (q.revision || 0) });
+    send(['sales_manager'], { title: 'Quotation ' + q.id + ' awaiting your approval', body: q.accountName + ' · ' + fmt.money(q.quoteValue) + (q.discountPct > 5 ? ' · discount ' + q.discountPct + '%' : ''), link: '#/quotations/' + q.id, severity: 'warn', key: 'qappr:' + q.id + ':' + (q.revision || 0) });
   }
   function approveQuote(q, remarks) {
     const at = nowIso();
     db.update('quotations', q.id, { approval: 'Approved', approvedBy: CRM.user().name, approvedAt: at, approvalRemarks: remarks || '', status: 'Sent', quoteDate: at }, { note: 'Quotation approved by Sales Manager and sent (quote given date auto-set)' });
     const e = db.get('enquiries', q.enquiryId);
-    if (e && STAGES.indexOf(e.stage) < 4) db.update('enquiries', e.id, { stage: 'Quotation Sent', stageHistory: (e.stageHistory || []).concat([{ stage: 'Quotation Sent', at, by: 'System', note: 'Quotation ' + q.id + ' approved & sent' }]) }, { note: 'Stage → Quotation Sent (quotation approved)' });
-    CRM.notify({ to: ['sales_exec'], title: 'Quotation ' + q.id + ' approved', body: q.accountName + ' · response time ' + hrsText(quoteResponseHrs(db.get('quotations', q.id))), link: '#/quotations/' + q.id, severity: 'ok', key: 'qok:' + q.id + ':' + (q.revision || 0) });
+    if (e && STAGES.indexOf(e.stage) < 4) { db.update('enquiries', e.id, { stage: 'Quotation Sent', stageHistory: (e.stageHistory || []).concat([{ stage: 'Quotation Sent', at, by: 'System', note: 'Quotation ' + q.id + ' approved & sent' }]) }, { note: 'Stage → Quotation Sent (quotation approved)' }); otsOutcome(e, 'Quotation Sent', { quoteId: q.id, quoteValue: q.quoteValue }); }
+    if (q.execId !== me()) sendUser(q.execId, ['sales_exec'], { title: 'Quotation ' + q.id + ' approved', body: q.accountName + ' · response time ' + hrsText(quoteResponseHrs(db.get('quotations', q.id))), link: '#/quotations/' + q.id, severity: 'ok', key: 'qok:' + q.id + ':' + (q.revision || 0) });
   }
   function rejectQuote(q) {
     ui.formModal('Reject quotation ' + q.id, [{ key: 'remarks', label: 'Reason / revision required', type: 'textarea', required: true }], {}, (v) => {
       db.update('quotations', q.id, { approval: 'Rejected', approvalRemarks: v.remarks, approvedBy: CRM.user().name, approvedAt: nowIso(), status: 'Pending' }, { note: 'Quotation rejected by Sales Manager: ' + v.remarks });
-      CRM.notify({ to: ['sales_exec'], title: 'Quotation ' + q.id + ' sent back for revision', body: v.remarks, link: '#/quotations/' + q.id, severity: 'warn', key: 'qrej:' + q.id + ':' + (q.revision || 0) });
+      sendUser(q.execId, ['sales_exec'], { title: 'Quotation ' + q.id + ' sent back for revision', body: v.remarks, link: '#/quotations/' + q.id, severity: 'warn', key: 'qrej:' + q.id + ':' + (q.revision || 0) });
       ui.toast('Quotation returned to executive', 'warn'); CRM.refresh();
     });
   }
@@ -340,7 +437,7 @@
     if (status === 'Approved') patch.customerApprovedAt = nowIso();
     db.update('quotations', q.id, patch, { note: 'Customer status → ' + status });
     const e = db.get('enquiries', q.enquiryId);
-    if (e && status === 'Under Discussion' && STAGES.indexOf(e.stage) < 5) db.update('enquiries', e.id, { stage: 'Negotiation', stageHistory: (e.stageHistory || []).concat([{ stage: 'Negotiation', at: nowIso(), by: CRM.user().name, note: 'Quotation under discussion' }]) });
+    if (e && status === 'Under Discussion' && STAGES.indexOf(e.stage) < 5) { db.update('enquiries', e.id, { stage: 'Negotiation', stageHistory: (e.stageHistory || []).concat([{ stage: 'Negotiation', at: nowIso(), by: CRM.user().name, note: 'Quotation under discussion' }]) }); otsOutcome(e, 'Negotiation', { quoteId: q.id }); }
     ui.toast('Quotation marked ' + status, status === 'Rejected' ? 'warn' : 'ok');
     if (status === 'Approved' && e && OPEN.includes(e.stage)) {
       ui.confirm('Customer approved the quotation', 'Convert ' + e.id + ' to Order Won now? A Sales Order must be issued within ' + SLA.soHrs + ' hours of customer approval (policy 4.3).', () => { setTimeout(() => moveStage(db.get('enquiries', e.id), 'Order Won'), 50); });
@@ -377,12 +474,27 @@
       enquiryId: e.id, quotationId: q ? q.id : '', customerId, accountName: e.accountName, division: e.division, execId: e.execId,
       productId: e.productId, product: e.product, quantity: e.quantity, value: Number(v.orderValue) || e.expectedValue, wonDate: nowIso(),
       poNumber: v.poNumber, materialAvailability: v.materialAvailability, deliveryCommitDate: v.deliveryCommitDate, paymentTerms: v.paymentTerms, creditDays: PAY_TERMS[v.paymentTerms] || 0,
-      approval: 'Awaiting Approval', soNumber: '', soIssuedDate: '', warrantyContract: q ? q.warrantyContract : '', newCustomer: !!e.isNewCustomer, salesChannel: e.salesChannel,
+      approval: 'Awaiting Approval', soNumber: '', soIssuedDate: '', warrantyContract: q ? q.warrantyContract : '', newCustomer: isNewCustomerId(customerId), salesChannel: e.salesChannel, leadSource: e.leadSource || '', dealerId: e.dealerId || '', otsId: e.otsId || '',
       scrapApplicable: q ? q.scrapApplicable === 'Yes' : false, scrapType: q ? q.scrapType : '', scrapQty: q ? q.scrapQty : 0, scrapCollected: false,
       installationStatus: 'Pending', installationCompletionDate: '', deliveredDate: '',
     }, divisionExtras(e.division, e.productId, e.quantity, q && q.lines)), { prefix: 'ORD', note: 'Order won from ' + e.id });
-    CRM.notify({ to: ['sales_manager'], title: 'Sale order ' + o.id + ' awaiting approval', body: e.accountName + ' · ' + fmt.money(o.value) + ' · PO ' + o.poNumber, link: '#/orders/' + o.id, severity: 'warn', key: 'soappr:' + o.id });
+    send(['sales_manager'], { title: 'Sale order ' + o.id + ' awaiting approval', body: e.accountName + ' · ' + fmt.money(o.value) + ' · PO ' + o.poNumber, link: '#/orders/' + o.id, severity: 'warn', key: 'soappr:' + o.id });
+    otsOutcome(e, 'Order Won', { orderId: o.id, revenue: o.value, quoteId: q ? q.id : '' });
     return o;
+  }
+  // New-customer acquisition: a customer is "new" until their first approved sale order; then promoted to Existing Customer
+  const isNewCustomerId = (id) => { const c = id && master.customer(id); return !!c && c.type === 'New Customer' && !db.one('orders', (o) => o.customerId === id && o.approval === 'Approved'); };
+  function promoteCustomer(customerId) {
+    const c = customerId && master.customer(customerId);
+    if (!c || c.type !== 'New Customer') return;
+    if (master.updateCustomer) master.updateCustomer(c.id, { type: 'Existing Customer' });
+    else db.update('customers', c.id, { type: 'Existing Customer', promotedAt: nowIso() }, { note: 'Customer type New → Existing (first sale order approved)' });
+  }
+  /** Distinct customers acquired: first approved order of a customer (flagged new at win time) falls in the period. */
+  function acquisitions(from, to, match) {
+    const first = {};
+    db.all('orders').filter((o) => o.approval === 'Approved' && o.customerId).forEach((o) => { const f = first[o.customerId]; if (!f || o.wonDate < f.wonDate) first[o.customerId] = o; });
+    return Object.values(first).filter((o) => o.newCustomer && inRange(o.wonDate, from, to) && (!match || match(o)));
   }
   function approveSO(o) {
     const at = nowIso();
@@ -392,15 +504,16 @@
     const order = db.get('orders', o.id);
     const enquiry = order.enquiryId ? db.get('enquiries', order.enquiryId) : null;
     CRM.emit('order.won', { order, enquiry });
-    CRM.notify({ to: ['accounts'], title: 'Raise invoice for ' + soNumber, body: order.accountName + ' · ' + fmt.money(order.value) + ' + GST · ' + order.paymentTerms, link: '#/invoices', severity: 'info', key: 'toinv:' + o.id });
-    CRM.notify({ to: ['sales_exec'], title: soNumber + ' approved', body: order.accountName + ' · SO processing ' + hrsText(soProcessingHrs(order)), link: '#/orders/' + o.id, severity: 'ok', key: 'sook:' + o.id });
+    promoteCustomer(order.customerId);
+    send(['accounts'], { title: 'Raise invoice for ' + soNumber, body: order.accountName + ' · ' + fmt.money(order.value) + ' + GST ' + gstPct(order.division) + '% · ' + order.paymentTerms, link: '#/invoices', severity: 'info', key: 'toinv:' + o.id });
+    sendUser(order.execId, ['sales_exec'], { title: soNumber + ' approved', body: order.accountName + ' · SO processing ' + hrsText(soProcessingHrs(order)), link: '#/orders/' + o.id, severity: 'ok', key: 'sook:' + o.id });
     suggestUpsells(order, true);
     ui.toast(soNumber + ' issued · order handed over' + (order.division === 'Power' ? ' to Service (warranty & PM)' : ' to Projects'), 'ok');
   }
   function rejectSO(o) {
     ui.formModal('Reject sale order ' + o.id, [{ key: 'remarks', label: 'Reason', type: 'textarea', required: true }], {}, (v) => {
       db.update('orders', o.id, { approval: 'Rejected', approvalRemarks: v.remarks, approvedBy: CRM.user().name, approvedAt: nowIso() }, { note: 'SO rejected: ' + v.remarks });
-      CRM.notify({ to: ['sales_exec'], title: 'Sale order ' + o.id + ' rejected', body: v.remarks, link: '#/orders/' + o.id, severity: 'bad', key: 'sorej:' + o.id + ':' + Date.now() });
+      sendUser(o.execId, ['sales_exec'], { title: 'Sale order ' + o.id + ' rejected', body: v.remarks, link: '#/orders/' + o.id, severity: 'bad', key: 'sorej:' + o.id + ':' + Date.now() });
       ui.toast('Sale order rejected', 'warn'); CRM.refresh();
     });
   }
@@ -418,18 +531,26 @@
       const qty = r.offer === 'Battery' ? Math.max(2, Math.min(16, Number(order.quantity) * 2)) : 1;
       created.push(db.insert('upsells', { customerId: order.customerId, accountName: order.accountName, orderId: order.id, baseProduct: order.product, type: r.type, offerCategory: r.offer, productId: offer.id, product: offer.name, quantity: qty, value: offer.price * qty, execId: order.execId, division: offer.division, status: 'Suggested', date: todayIso(), rationale: r.why, auto: true }, { prefix: 'UPS', silent: !notify }));
     });
-    if (notify && created.length) CRM.notify({ to: ['sales_exec'], title: created.length + ' upsell / cross-sell suggestions for ' + order.accountName, body: created.map((u) => u.type + ': ' + u.product).join(' · '), link: '#/upsell', severity: 'info', key: 'ups:' + order.id });
+    if (notify && created.length) sendUser(order.execId, ['sales_exec'], { title: created.length + ' upsell / cross-sell suggestions for ' + order.accountName, body: created.map((u) => u.type + ': ' + u.product).join(' · '), link: '#/upsell', severity: 'info', key: 'ups:' + order.id });
+    if (notify && created.length) send(['sales_coordinator'], { title: created.length + ' upsell / cross-sell suggestions for ' + order.accountName, body: 'Owner ' + execName(order.execId), link: '#/upsell', severity: 'info', key: 'upsc:' + order.id });
     return created;
   }
 
   // ============================================================ invoices & payments (Accounts)
+  /** Default invoice value: order value + division GST, less scrap buy-back agreed on the quotation (= quote value when unchanged). */
+  function invoiceDefault(o) {
+    const q = o.quotationId && db.get('quotations', o.quotationId);
+    if (q && Number(q.basicValue) === Number(o.value) && q.quoteValue) return Math.round(q.quoteValue);
+    return withGst(o.value, o.division) - Math.round(Number(q && q.scrapValue) || 0);
+  }
   function raiseInvoice(o, existing) {
+    const q = o.quotationId && db.get('quotations', o.quotationId);
     const terms = (existing && existing.paymentTerms) || o.paymentTerms || 'Credit 30 days';
     const fields = [
       { key: 'invoiceNo', label: 'Invoice number', type: 'readonly' },
-      { key: 'invoiceDate', label: 'Invoice date', type: 'date', required: true },
-      { key: 'value', label: 'Invoice value (₹ incl. GST)', type: 'number', required: true },
-      { key: 'paymentTerms', label: 'Payment terms', type: 'select', options: Object.keys(PAY_TERMS), required: true, onChange: (val, inp) => { inp.dueDate.value = util.iso(util.addDays(inp.invoiceDate.value || CRM.TODAY, PAY_TERMS[val] || 0)); } },
+      { key: 'invoiceDate', label: 'Invoice date', type: 'date', required: true, onChange: (val, inp) => { if (val) inp.dueDate.value = util.iso(util.addDays(parseD(val), PAY_TERMS[inp.paymentTerms.value] || 0)); } },
+      { key: 'value', label: 'Invoice value (₹ incl. GST ' + gstPct(o.division) + '%' + (q && Number(q.scrapValue) ? ', net of scrap buy-back' : '') + ')', type: 'number', required: true },
+      { key: 'paymentTerms', label: 'Payment terms', type: 'select', options: Object.keys(PAY_TERMS), required: true, onChange: (val, inp) => { inp.dueDate.value = util.iso(util.addDays(inp.invoiceDate.value ? parseD(inp.invoiceDate.value) : CRM.TODAY, PAY_TERMS[val] || 0)); } },
       { key: 'dueDate', label: 'Payment due date (auto from terms)', type: 'date', required: true },
       { key: 'confirmedWith', label: 'Confirmed with (customer contact)' },
       { key: 'hardCopySubmitted', label: 'Invoice hard copy submitted', type: 'checkbox' },
@@ -437,49 +558,56 @@
       { key: 'remarks', label: 'Remarks', type: 'textarea' },
     ];
     const invDate = existing ? existing.invoiceDate : todayIso();
-    const vals = existing ? Object.assign({}, existing) : { invoiceNo: '(auto on save)', invoiceDate: invDate, value: Math.round(o.value * 1.18), paymentTerms: terms, dueDate: util.iso(util.addDays(invDate, PAY_TERMS[terms] || 0)), confirmedWith: (master.customer(o.customerId) || {}).contact || '' };
+    const vals = existing ? Object.assign({}, existing) : { invoiceNo: '(auto on save)', invoiceDate: invDate, value: invoiceDefault(o), paymentTerms: terms, dueDate: util.iso(util.addDays(parseD(invDate), PAY_TERMS[terms] || 0)), confirmedWith: (master.customer(o.customerId) || {}).contact || '' };
     ui.formModal(existing ? 'Update invoice ' + existing.invoiceNo : 'Raise invoice · ' + (o.soNumber || o.id), fields, vals, (v) => {
       delete v.invoiceNo;
+      if (v.dueDate && v.invoiceDate && v.dueDate < v.invoiceDate) { ui.toast('Payment due date cannot be before the invoice date', 'bad'); return false; }
+      if (!(v.value > 0)) { ui.toast('Invoice value must be greater than zero', 'bad'); return false; }
       if (existing) { db.update('invoices', existing.id, v, { note: 'Invoice updated by Accounts' }); ui.toast('Invoice updated', 'ok'); CRM.refresh(); return; }
       const seq = CRM.nextId('INVNO').split('-')[1];
-      const inv = db.insert('invoices', Object.assign(v, { invoiceNo: 'MPCS/' + fy(v.invoiceDate) + '/INV-' + seq, orderId: o.id, soNumber: o.soNumber, customerId: o.customerId, accountName: o.accountName, division: o.division, execId: o.execId, source: 'Sales' }), { prefix: 'INV', note: 'Invoice raised' });
+      const inv = db.insert('invoices', Object.assign(v, { invoiceNo: 'MPCS/' + fy(parseD(v.invoiceDate)) + '/INV-' + seq, orderId: o.id, soNumber: o.soNumber, customerId: o.customerId, accountName: o.accountName, division: o.division, execId: o.execId, gstPct: gstPct(o.division), scrapValue: q ? Number(q.scrapValue) || 0 : 0, source: 'Sales' }), { prefix: 'INV', note: 'Invoice raised' });
       CRM.emit('invoice.raised', { invoice: inv });
-      CRM.notify({ to: ['sales_exec', 'sales_manager'], title: 'Invoice ' + inv.invoiceNo + ' raised', body: inv.accountName + ' · ' + fmt.money(inv.value) + ' · due ' + fmt.date(inv.dueDate), link: '#/payments', severity: 'info', key: 'inv:' + inv.id });
+      const nb = { title: 'Invoice ' + inv.invoiceNo + ' raised', body: inv.accountName + ' · ' + fmt.money(inv.value) + ' · due ' + fmt.date(inv.dueDate), severity: 'info', key: 'inv:' + inv.id };
+      sendUser(inv.execId, ['sales_exec'], nb, ['#/orders/' + o.id]);
+      send(['sales_manager'], nb, ['#/payments']);
       ui.toast('Invoice ' + inv.invoiceNo + ' raised', 'ok'); CRM.refresh();
     }, { sub: o.accountName + ' · order value ' + fmt.money(o.value) + ' + GST' });
   }
   function recordPayment(inv, opts) {
     opts = opts || {};
-    const list = inv ? [inv] : allInvoices().filter((i) => outstandingOf(i) > 0);
+    const list = inv ? [inv] : allInvoices().filter((i) => collectableOf(i) > 0);
     if (!list.length) { ui.toast('No invoices with outstanding balance', 'warn'); return; }
     const fields = [
-      { key: 'invoiceId', label: 'Invoice', type: 'select', required: true, options: list.map((i) => ({ value: i.id, label: i.invoiceNo + ' · ' + i.accountName + ' · O/S ' + fmt.money(outstandingOf(i)) })), onChange: (val, inp) => { const x = db.get('invoices', val); if (x) inp.value.value = outstandingOf(x); } },
+      { key: 'invoiceId', label: 'Invoice', type: 'select', required: true, options: list.map((i) => ({ value: i.id, label: i.invoiceNo + ' · ' + i.accountName + ' · O/S ' + fmt.money(outstandingOf(i)) + (pendingOf(i) ? ' (' + fmt.money(pendingOf(i)) + ' awaiting verification)' : '') })), onChange: (val, inp) => { const x = db.get('invoices', val); if (x) inp.value.value = collectableOf(x); } },
       { key: 'receivedDate', label: 'Payment received date', type: 'date', required: true, default: todayIso() },
       { key: 'value', label: 'Received value (₹)', type: 'number', required: true },
       { key: 'mode', label: 'Payment mode', type: 'select', options: PAY_MODES, required: true },
       { key: 'reference', label: 'Reference (UTR / cheque no.)' },
       { key: 'confirmedWith', label: 'Confirmed with' },
     ];
-    ui.formModal(opts.title || 'Record payment received', fields, { invoiceId: list[0].id, value: outstandingOf(list[0]) }, (v) => {
+    ui.formModal(opts.title || 'Record payment received', fields, { invoiceId: list[0].id, value: collectableOf(list[0]) }, (v) => {
       const i = db.get('invoices', v.invoiceId);
-      const os = outstandingOf(i);
+      const os = collectableOf(i);
       if (!(v.value > 0)) { ui.toast('Received value must be greater than zero', 'bad'); return false; }
-      if (v.value > os) { ui.toast('Received value exceeds outstanding of ' + fmt.money(os), 'bad'); return false; }
+      if (v.value > os) { ui.toast('Received value exceeds outstanding of ' + fmt.money(os) + (pendingOf(i) ? ' (after ' + fmt.money(pendingOf(i)) + ' awaiting verification)' : ''), 'bad'); return false; }
       const verified = isAcc();
       db.insert('payments', { invoiceId: i.id, orderId: i.orderId, customerId: i.customerId, accountName: i.accountName, division: i.division, execId: i.execId, receivedDate: v.receivedDate, value: v.value, mode: v.mode, reference: v.reference, confirmedWith: v.confirmedWith, recordedBy: CRM.user().name, verified, onTime: !i.dueDate || v.receivedDate <= util.iso(i.dueDate) }, { prefix: 'PAY', note: 'Payment ' + fmt.money(v.value) + ' via ' + v.mode });
       if (v.confirmedWith) db.update('invoices', i.id, { confirmedWith: v.confirmedWith }, { silent: true });
-      if (!verified) CRM.notify({ to: ['accounts'], title: 'Payment update from field: ' + i.invoiceNo, body: fmt.money(v.value) + ' via ' + v.mode + ' — please verify', link: '#/payments', severity: 'info', key: 'payv:' + i.id + ':' + Date.now() });
-      ui.toast('Payment of ' + fmt.money(v.value) + ' recorded · outstanding ' + fmt.money(outstandingOf(i)), 'ok');
+      if (!verified) send(['accounts'], { title: 'Payment update from field: ' + i.invoiceNo, body: fmt.money(v.value) + ' via ' + v.mode + ' — please verify', link: '#/payments', severity: 'info', key: 'payv:' + i.id + ':' + Date.now() });
+      ui.toast('Payment of ' + fmt.money(v.value) + ' recorded' + (verified ? ' · outstanding ' + fmt.money(outstandingOf(i)) : ' · outstanding updates once Accounts verifies it'), 'ok');
       (opts.onDone || CRM.refresh)();
     });
   }
 
   // ============================================================ policy monitor (Sales & Installation violations, escalation matrix)
-  const LEVELS = [null, { label: 'L1 · Executive', to: ['sales_exec'] }, { label: 'L2 · Sales Coordinator', to: ['sales_coordinator'] }, { label: 'L3 · Sales Head', to: ['sales_manager'] }, { label: 'L4 · Management', to: ['gm'] }];
+  // Escalation ladder (Service_requirement §2/§14): breach → L1 executive · +6 h L2 coordinator · +12 h L3 sales head · +24 h L4 management (configurable)
+  const LEVELS = [null, { label: 'L1 · Executive', to: ['sales_exec'] }, { label: 'L2 · Sales Coordinator', to: ['sales_coordinator'] }, { label: 'L3 · Sales Head', to: ['sales_manager'] }, { label: 'L4 · Management', to: ['gm', 'odm'] }];
   function policyBreaches() {
     const now = new Date();
     const out = [];
-    const lvl = (over) => (over < 6 ? 1 : over < 12 ? 2 : over < 48 ? 3 : 4);
+    const esc = cfg('sales.escalation'), pesc = cfg('sales.paymentEscalation');
+    const lvl = (over) => (over < esc.l2 ? 1 : over < esc.l3 ? 2 : over < esc.l4 ? 3 : 4);
+    const payLvl = (days) => (days < pesc.l2 ? 1 : days < pesc.l3 ? 2 : days < pesc.l4 ? 3 : 4); // payment delays escalate on a day-based ladder
     db.all('enquiries').forEach((e) => {
       if (!OPEN.includes(e.stage)) return;
       const age = util.hoursBetween(e.createdAt, now);
@@ -495,15 +623,15 @@
     });
     db.all('invoices').forEach((i) => {
       if (outstandingOf(i) <= 0 || !i.dueDate || util.iso(i.dueDate) >= todayIso()) return;
-      const over = util.daysBetween(i.dueDate, CRM.TODAY) * 24;
-      out.push({ type: 'Payment Collection Delay', ref: 'Installation 5.2', severity: 'Medium', rec: i, col: 'invoices', link: '#/outstanding', owner: i.execId, division: i.division, over, details: i.invoiceNo + ' · ' + fmt.money(outstandingOf(i)) + ' overdue beyond credit policy (' + i.paymentTerms + ')' });
+      const days = util.daysBetween(parseD(util.iso(i.dueDate)), CRM.TODAY);
+      out.push({ type: 'Payment Collection Delay', ref: 'Installation 5.2', severity: 'Medium', rec: i, col: 'invoices', link: '#/outstanding', links: ['#/outstanding', i.orderId ? '#/orders/' + i.orderId : '#/salespolicy'], owner: i.execId, division: i.division, over: days * 24, overDays: days, level: payLvl(days), details: i.invoiceNo + ' · ' + fmt.money(outstandingOf(i)) + ' overdue ' + days + ' d beyond credit policy (' + i.paymentTerms + ')' });
     });
     db.all('orders').forEach((o) => {
       if (o.division !== 'Power' || !o.scrapApplicable || o.scrapCollected || !o.installationCompletionDate) return;
-      const age = util.hoursBetween(o.installationCompletionDate, now);
+      const age = util.hoursBetween(parseD(util.iso(o.installationCompletionDate)), now);
       if (age > SLA.scrapHrs) out.push({ type: 'Scrap Collection Delay', ref: 'Installation 5.3', severity: 'Medium', rec: o, col: 'orders', link: '#/orders/' + o.id, owner: o.execId, division: o.division, over: age - SLA.scrapHrs, details: (o.scrapQty || '') + ' ' + (o.scrapType || 'scrap') + ' not collected 24 h after installation (' + (o.soNumber || o.id) + ')' });
     });
-    out.forEach((b) => { b.level = lvl(b.over); });
+    out.forEach((b) => { if (!b.level) b.level = lvl(b.over); if (!b.links) b.links = [b.link, '#/salespolicy']; });
     return out;
   }
   let scanning = false;
@@ -516,20 +644,35 @@
         if (!prev) CRM.emit('violation.raise', { division: b.division, type: b.type, policyRef: b.ref, owner: b.owner, severity: b.severity, recordId: b.rec.id, link: b.link, details: b.details });
         if (b.level > prev) {
           const L = LEVELS[b.level];
-          const to = b.type === 'Payment Collection Delay' && b.level === 1 ? ['accounts', 'sales_exec'] : L.to;
-          CRM.notify({ to, title: b.type + ' · ' + L.label, body: b.details + ' · owner ' + execName(b.owner), link: b.link, severity: b.level >= 3 ? 'bad' : 'warn', key: 'pol:' + b.type + ':' + b.rec.id + ':L' + b.level });
+          const n = { title: b.type + ' · ' + L.label, body: b.details + ' · owner ' + execName(b.owner), severity: b.level >= 3 ? 'bad' : 'warn', key: 'pol:' + b.type + ':' + b.rec.id + ':L' + b.level };
+          // L1 goes to the owning executive only (plus Accounts for collections); higher levels go to the ladder role
+          if (b.level === 1) { if (b.owner) sendUser(b.owner, ['sales_exec'], n, b.links); if (b.type === 'Payment Collection Delay') send(['accounts'], n, b.links); else if (!b.owner) send(['sales_coordinator'], n, b.links); }
+          else send(L.to, n, b.links);
           db.update(b.col, b.rec.id, { policyFlags: Object.assign({}, flags, { [b.type]: b.level }) }, { silent: true });
         }
       });
-      // automatic reminders: follow-ups due / missed, quotation response pending, payment due
-      const t = todayIso();
-      const fus = db.find('followups', (f) => f.status === 'Planned');
-      const due = fus.filter((f) => f.dueDate === t), missed = fus.filter((f) => f.dueDate < t);
-      if (due.length) CRM.notify({ to: ['sales_exec'], title: due.length + ' follow-ups due today', body: due.slice(0, 4).map((f) => f.accountName).join(', ') + (due.length > 4 ? '…' : ''), link: '#/followups', severity: 'info', key: 'fudue:' + t });
-      if (missed.length) CRM.notify({ to: ['sales_exec', 'sales_coordinator'], title: missed.length + ' missed follow-ups', body: 'Follow-ups past their scheduled date are still open', link: '#/followups', severity: 'warn', key: 'fumiss:' + t });
-      db.find('quotations', (q) => q.status === 'Sent' && q.quoteDate && util.daysBetween(q.quoteDate, CRM.TODAY) >= SLA.quoteResponseDays).forEach((q) => CRM.notify({ to: ['sales_exec'], title: 'Quotation response pending: ' + q.id, body: q.accountName + ' · sent ' + fmt.rel(q.quoteDate) + ' — follow up with customer', link: '#/quotations/' + q.id, severity: 'warn', key: 'qresp:' + q.id }));
-      db.find('invoices', (i) => outstandingOf(i) > 0 && i.dueDate && util.iso(i.dueDate) >= t && util.daysBetween(CRM.TODAY, i.dueDate) <= 3).forEach((i) => CRM.notify({ to: ['accounts', 'sales_exec'], title: 'Payment due ' + fmt.rel(i.dueDate) + ': ' + i.invoiceNo, body: i.accountName + ' · ' + fmt.money(outstandingOf(i)), link: '#/payments', severity: 'info', key: 'paydue:' + i.id }));
+      runReminders();
     } finally { scanning = false; }
+  }
+  /** Automatic reminders (re-checked on every data change and on a timer): follow-ups due / missed, quotation response pending, payment due. Per executive — no team-wide broadcast. */
+  function runReminders() {
+    const t = todayIso(), rem = cfg('sales.reminders');
+    const fus = db.find('followups', (f) => f.status === 'Planned');
+    const byExec = util.groupBy(fus.filter((f) => f.dueDate <= t), (f) => f.execId || '');
+    Object.keys(byExec).forEach((ex) => {
+      const due = byExec[ex].filter((f) => f.dueDate === t), missed = byExec[ex].filter((f) => f.dueDate < t);
+      if (!ex) return;
+      if (due.length) sendUser(ex, ['sales_exec'], { title: due.length + ' follow-up' + (due.length > 1 ? 's' : '') + ' due today', body: due.slice(0, 4).map((f) => f.accountName).join(', ') + (due.length > 4 ? '…' : ''), link: '#/followups', severity: 'info', key: 'fudue:' + t });
+      if (missed.length) sendUser(ex, ['sales_exec'], { title: missed.length + ' missed follow-up' + (missed.length > 1 ? 's' : ''), body: 'Past their scheduled date and still open: ' + missed.slice(0, 3).map((f) => f.accountName).join(', ') + (missed.length > 3 ? '…' : ''), link: '#/followups', severity: 'warn', key: 'fumiss:' + t });
+    });
+    const missedAll = fus.filter((f) => f.dueDate < t);
+    if (missedAll.length) send(['sales_coordinator'], { title: missedAll.length + ' missed follow-ups across the team', body: Object.entries(util.countBy(missedAll, (f) => execName(f.execId))).map(([k, v]) => k + ' ' + v).join(' · '), link: '#/followups', severity: 'warn', key: 'fumissc:' + t });
+    db.find('quotations', (q) => q.status === 'Sent' && q.quoteDate && util.daysBetween(q.quoteDate, CRM.TODAY) >= SLA.quoteResponseDays).forEach((q) => sendUser(q.execId, ['sales_exec'], { title: 'Quotation response pending: ' + q.id, body: q.accountName + ' · sent ' + fmt.rel(q.quoteDate) + ' — follow up with customer', link: '#/quotations/' + q.id, severity: 'warn', key: 'qresp:' + q.id }));
+    db.find('invoices', (i) => outstandingOf(i) > 0 && i.dueDate && util.iso(i.dueDate) >= t && util.daysBetween(CRM.TODAY, parseD(util.iso(i.dueDate))) <= (Number(rem.paymentDueDays) || 0)).forEach((i) => {
+      const n = { title: 'Payment due ' + fmt.rel(i.dueDate) + ': ' + i.invoiceNo, body: i.accountName + ' · ' + fmt.money(outstandingOf(i)), severity: 'info', key: 'paydue:' + i.id };
+      send(['accounts'], n, ['#/payments']);
+      if (i.execId) sendUser(i.execId, ['sales_exec'], n, [i.orderId ? '#/orders/' + i.orderId : '#/mobile']);
+    });
   }
 
   // ============================================================ seed data (≈6 months relative to CRM.TODAY)
@@ -569,6 +712,14 @@
     const leadFor = (ch) => ({ OTS: 'Existing Customer Business', 'Office Walk-in': 'Walk-in', 'Upselling & Cross Selling': 'Existing Customer Business', 'Cold Calling': 'Cold Calling', 'Digital Marketing': P(['Website', 'Campaign']), 'Referral Sales': P(['Existing Customer Reference', 'Dealer']), Advertisements: 'Campaign', 'Business Forums': 'Campaign' }[ch]);
     const NOTES = { 'Contact Made': 'Spoke to customer, requirement confirmed', 'Site Visit Scheduled': 'Site visit fixed with customer', 'Site Visit Completed': 'Site surveyed, load / coverage noted', 'Quotation Sent': 'Quotation shared on mail & WhatsApp', Negotiation: 'Customer negotiating on price and delivery', 'Order Won': 'PO received from customer', 'Order Lost': 'Customer went with competitor' };
 
+    // ---- dealers (dealer-reported monthly sales; dealer-sourced orders are linked by dealerId below)
+    const dealers = [];
+    const DEALERS = [['Sri Vinayaga Power Systems', 'Tiruppur', 'Power'], ['Kongu Electricals', 'Erode', 'Power'], ['Pollachi Inverter House', 'Pollachi', 'Power'], ['Mettupalayam Power Point', 'Mettupalayam', 'Power'], ['SecureNet Solutions', 'Peelamedu', 'Electronic Security'], ['SunPath Solar Agencies', 'Tiruppur', 'Solar']];
+    DEALERS.forEach(([name, area, division], i) => {
+      const sales = {}; monthsBack(7).forEach((mk) => { sales[mk] = R(4, 22) * 25000 * (division === 'Solar' ? 2 : 1); });
+      dealers.push(sdb.insert('dealers', { name, area, division, execId: division === 'Power' ? (i % 2 ? arun : (of('Power')[0] || arun)) : P(pool[division]), contact: P(FN) + ' ' + P(['R', 'K', 'S']), phone: '94' + R(10000000, 99999999), since: util.iso(util.addDays(T, -R(300, 2400))), creditLimit: R(2, 10) * 100000, sales, status: 'Active' }, { prefix: 'DLR', silent: true }));
+    });
+
     // ---- plan enquiries, then insert in chronological order so ENQ numbers increase with date
     const plan = [];
     for (let i = 0; i < 84; i++) {
@@ -592,6 +743,7 @@
       const expectedValue = Math.round(sum(lines, (l) => l.qty * l.rate) / 1000) * 1000;
       const execId = pl.ots ? '' : P(pool[pl.division]);
       const channel = pl.ots ? 'OTS' : chanFor(!!c);
+      const leadFor0 = leadFor(channel);
       const sv = pl.division !== 'Power' || Math.random() < 0.15;
       const r = Math.random();
       const outcome = pl.ots ? 'open' : pl.ageDays > 25 ? (r < 0.58 ? 'won' : r < 0.84 ? 'lost' : 'open') : pl.ageDays > 4 ? (r < 0.35 ? 'won' : r < 0.52 ? 'lost' : 'open') : 'open';
@@ -614,8 +766,9 @@
         createdAt: iso(pl.created), date: util.iso(pl.created), month: enqMonth(pl.created), execId, assignRule: execId ? 'Division + Area match' : '', assignedAt: execId ? iso(pl.created) : '',
         customerId: c ? c.id : '', accountName: c ? c.name : pr[0], contactName: c ? c.contact : P(FN) + ' ' + P(['R', 'S', 'K', 'M']), contactNumber: c ? c.phone : '9' + R(100000000, 999999999),
         email: c ? c.email : pr[0].toLowerCase().replace(/[^a-z]+/g, '.') + '@example.in', area: c ? c.area : pr[2], segment: c ? c.segment : pr[1], customerType: c ? c.type : 'New Customer',
-        businessType: c && c.type !== 'New Customer' ? 'Existing Customer Business' : 'New Customer Business', salesChannel: channel, referralType: channel === 'Referral Sales' ? P(REFERRAL_TYPES) : '', leadSource: leadFor(channel),
+        businessType: c && c.type !== 'New Customer' ? 'Existing Customer Business' : 'New Customer Business', salesChannel: channel, referralType: channel === 'Referral Sales' ? (leadFor0 === 'Dealer' ? 'Dealer reference' : P(REFERRAL_TYPES)) : '', leadSource: leadFor0,
         sourceDetails: pl.ots ? 'Sales OTS from service visit · battery qty ' + qty + ' (> 2 → Sales OTS) · awaiting coordinator assignment' : channel === 'Digital Marketing' ? P(['Google Ads form', 'Website chat', 'Facebook lead']) : channel === 'Business Forums' ? P(['CODISSIA meet', 'BNI chapter', 'Rotary expo']) : channel === 'OTS' ? 'Raised by service engineer during complaint visit' : '',
+        dealerId: leadFor0 === 'Dealer' ? (P(dealers.filter((d) => d.division === pl.division)) || P(dealers) || {}).id || '' : '',
         division: pl.division, category: p.category, productId: p.id, product: p.name, quantity: qty, expectedValue, remarks: P(['', 'Budget approved', 'Comparing 2 vendors', 'Urgent requirement', 'Needs demo', '']),
         stage, callStatus: kept.length ? 'Connected' : P(['', 'Not Reachable', 'Call Back Requested']), progressNotes: NOTES[stage] || 'New enquiry logged',
         siteVisitRequired: sv, siteVisitDate: evAt('Site Visit Scheduled') ? util.iso(evAt('Site Visit Completed') || plusH(evAt('Site Visit Scheduled'), 20)) : '', siteVisitDoneAt: evAt('Site Visit Completed') ? iso(evAt('Site Visit Completed')) : '',
@@ -638,7 +791,7 @@
       const disc = R(0, 4) * 2;
       const scrapOk = pl.division === 'Power' && /Battery|Inverter|UPS/.test(p.category) && Math.random() < 0.5;
       const qBase = { enquiryId: e.id, customerId: e.customerId, accountName: e.accountName, division: e.division, execId, lines, discountPct: disc, scrapApplicable: scrapOk ? 'Yes' : 'No', scrapType: scrapOk ? 'Battery' : '', scrapQty: scrapOk ? R(1, 6) : 0, scrapValue: scrapOk ? R(2, 8) * 500 : 0, scrapDetails: scrapOk ? 'Old batteries to be taken back as buy-back' : '', warrantyContract: pl.division === 'Solar' ? WARRANTY[5] : P(WARRANTY.slice(0, 4)), paymentTerms: P(['Credit 30 days', 'Credit 15 days', '100% Advance', 'Credit 45 days', 'Against delivery']), validityDays: 15, revision: 0 };
-      Object.assign(qBase, computeQuote(lines, disc, qBase.scrapValue));
+      Object.assign(qBase, computeQuote(lines, disc, qBase.scrapValue, pl.division));
       if (qAt) {
         let status = stage === 'Order Won' ? 'Approved' : stage === 'Order Lost' ? 'Rejected' : stage === 'Negotiation' ? 'Under Discussion' : P(['Sent', 'Sent', 'Pending']);
         let custAt = stage === 'Order Won' ? iso(plusH(evAt('Order Won'), -R(2, 20))) : '';
@@ -652,6 +805,8 @@
       // ---- order, invoice and payments for won enquiries
       if (stage === 'Order Won') {
         const wonAt = evAt('Order Won');
+        const known = !e.customerId && sdb.one('customers', (x) => x.name === e.accountName);
+        if (known) { e.customerId = known.id; e.customerType = known.type; }
         if (!e.customerId) { // prospect converted to customer on winning
           const nc = sdb.insert('customers', { id: nextCustomerId(), name: e.accountName, type: 'New Customer', contact: e.contactName, phone: e.contactNumber, email: e.email, area: e.area, segment: e.segment, gstin: '', since: util.iso(wonAt), source: 'Converted from ' + e.id }, { silent: true });
           sdb.insert('sites', { customerId: nc.id, name: 'Main Site', address: R(1, 240) + ', ' + e.area + ', Coimbatore', contact: e.contactName, phone: e.contactNumber, access: 'Reception' }, { silent: true });
@@ -660,6 +815,9 @@
         const q = sdb.one('quotations', (x) => x.enquiryId === e.id);
         const recent = util.hoursBetween(wonAt, NOW) < 60;
         const awaiting = recent && soAwait < 3; if (awaiting) soAwait++;
+        const firstOrder = !sdb.one('orders', (x) => x.customerId === e.customerId && x.approval === 'Approved');
+        const custRec = sdb.get('customers', e.customerId);
+        const isNew = firstOrder && (!custRec || custRec.type === 'New Customer');
         const soAt = awaiting ? null : capNow(plusH(wonAt, Math.random() < 0.72 ? R(2, 20) : R(26, 60)));
         const terms = q ? q.paymentTerms : 'Credit 30 days';
         const deliv = util.addDays(soAt || wonAt, R(3, 14));
@@ -671,15 +829,16 @@
           enquiryId: e.id, quotationId: q ? q.id : '', customerId: e.customerId, accountName: e.accountName, division: e.division, execId, productId: p.id, product: p.name, quantity: qty,
           value: q ? q.basicValue : expectedValue, wonDate: iso(wonAt), poNumber: 'PO/' + e.accountName.replace(/[^A-Z]/g, '').slice(0, 4) + '/' + R(100, 999), materialAvailability: P(MATERIAL),
           deliveryCommitDate: util.iso(deliv), paymentTerms: terms, creditDays: PAY_TERMS[terms] || 0, approval: awaiting ? 'Awaiting Approval' : 'Approved', approvedBy: awaiting ? '' : 'Ramesh K', approvedAt: soAt ? iso(soAt) : '',
-          soNumber: soAt ? 'SO/' + fy(soAt) + '/' + CRM.nextId('SONO').split('-')[1] : '', soIssuedDate: soAt ? iso(soAt) : '', warrantyContract: q ? q.warrantyContract : '', newCustomer: e.isNewCustomer, salesChannel: channel,
+          soNumber: soAt ? 'SO/' + fy(soAt) + '/' + CRM.nextId('SONO').split('-')[1] : '', soIssuedDate: soAt ? iso(soAt) : '', warrantyContract: q ? q.warrantyContract : '', newCustomer: isNew, salesChannel: channel, leadSource: e.leadSource, dealerId: e.dealerId || '',
           scrapApplicable: q ? q.scrapApplicable === 'Yes' : false, scrapType: q ? q.scrapType : '', scrapQty: q ? q.scrapQty : 0, scrapCollected: q && q.scrapApplicable === 'Yes' ? scrapCollected : false,
           installationStatus: instDone ? 'Completed' : soAt ? 'Scheduled' : 'Pending', installationCompletionDate: instDone ? util.iso(instDone) : '', deliveredDate: instDone ? util.iso(instDone) : '', createdAt: iso(wonAt),
         }, divisionExtras(e.division, p.id, qty, lines)), { prefix: 'ORD', silent: true });
         createdOrders.push(o);
+        if (soAt && custRec && custRec.type === 'New Customer') Object.assign(custRec, { type: 'Existing Customer', promotedAt: iso(soAt) }); // promoted after first approved order
         if (soAt && util.daysBetween(soAt, T) >= 4 && Math.random() < 0.92) {
           const invDate = util.addDays(soAt, R(0, 3)) > T ? T : util.addDays(soAt, R(0, 3));
           const due = util.addDays(invDate, o.creditDays);
-          const inv = sdb.insert('invoices', { invoiceNo: 'MPCS/' + fy(invDate) + '/INV-' + CRM.nextId('INVNO').split('-')[1], orderId: o.id, soNumber: o.soNumber, customerId: o.customerId, accountName: o.accountName, division: o.division, execId, invoiceDate: util.iso(invDate), value: Math.round(o.value * 1.18), paymentTerms: terms, dueDate: util.iso(due), hardCopySubmitted: Math.random() < 0.8, invoiceMailed: Math.random() < 0.9, confirmedWith: (master.customer(o.customerId) || {}).contact || e.contactName, source: 'Sales', createdAt: iso(invDate) }, { prefix: 'INV', silent: true });
+          const inv = sdb.insert('invoices', { invoiceNo: 'MPCS/' + fy(invDate) + '/INV-' + CRM.nextId('INVNO').split('-')[1], orderId: o.id, soNumber: o.soNumber, customerId: o.customerId, accountName: o.accountName, division: o.division, execId, invoiceDate: util.iso(invDate), value: withGst(o.value, o.division) - (q ? Number(q.scrapValue) || 0 : 0), gstPct: gstPct(o.division), scrapValue: q ? Number(q.scrapValue) || 0 : 0, paymentTerms: terms, dueDate: util.iso(due), hardCopySubmitted: Math.random() < 0.8, invoiceMailed: Math.random() < 0.9, confirmedWith: (master.customer(o.customerId) || {}).contact || e.contactName, source: 'Sales', createdAt: iso(invDate) }, { prefix: 'INV', silent: true });
           const pay = (d, v, mode) => sdb.insert('payments', { invoiceId: inv.id, orderId: o.id, customerId: o.customerId, accountName: o.accountName, division: o.division, execId, receivedDate: util.iso(d), value: Math.round(v), mode: mode || P(PAY_MODES), reference: 'UTR' + R(100000, 999999), confirmedWith: inv.confirmedWith, recordedBy: 'Meena P', verified: true, onTime: util.iso(d) <= inv.dueDate, createdAt: iso(d) }, { prefix: 'PAY', silent: true });
           const rr = Math.random();
           if (terms === '100% Advance') pay(invDate, inv.value, 'NEFT / RTGS');
@@ -698,7 +857,8 @@
 
     // ---- ensure one Power order shows a scrap-collection delay (installation done, scrap pending)
     if (!scrapBreach) {
-      const po = createdOrders.filter((o) => o.division === 'Power' && o.approval === 'Approved').sort((a, b) => (a.wonDate < b.wonDate ? 1 : -1))[0];
+      // pick an order whose SO was issued before the forced installation date (installation can never precede the SO)
+      const po = createdOrders.filter((o) => o.division === 'Power' && o.approval === 'Approved' && o.soIssuedDate && util.iso(o.soIssuedDate) <= util.iso(util.addDays(T, -3))).sort((a, b) => (a.wonDate < b.wonDate ? 1 : -1))[0];
       if (po) Object.assign(po, { scrapApplicable: true, scrapType: 'Battery', scrapQty: 4, scrapCollected: false, installationStatus: 'Completed', installationCompletionDate: util.iso(util.addDays(T, -2)), deliveredDate: util.iso(util.addDays(T, -2)) });
     }
 
@@ -761,13 +921,6 @@
       DIVS.forEach((d) => sdb.insert('targets', Object.assign({ scope: 'division', division: d, month: mk }, divT[d] || { revenue: baseRev[d], calls: 110, coldCalls: 60, newCustomers: 3, upsell: 2, crossSell: 3 }), { prefix: 'TGT', silent: true }));
     });
 
-    // ---- dealers with monthly dealer sales
-    const DEALERS = [['Sri Vinayaga Power Systems', 'Tiruppur', 'Power'], ['Kongu Electricals', 'Erode', 'Power'], ['Pollachi Inverter House', 'Pollachi', 'Power'], ['Mettupalayam Power Point', 'Mettupalayam', 'Power'], ['SecureNet Solutions', 'Peelamedu', 'Electronic Security'], ['SunPath Solar Agencies', 'Tiruppur', 'Solar']];
-    DEALERS.forEach(([name, area, division], i) => {
-      const sales = {}; monthsBack(7).forEach((mk) => { sales[mk] = R(4, 22) * 25000 * (division === 'Solar' ? 2 : 1); });
-      sdb.insert('dealers', { name, area, division, execId: division === 'Power' ? (i % 2 ? arun : (of('Power')[0] || arun)) : P(pool[division]), contact: P(FN) + ' ' + P(['R', 'K', 'S']), phone: '94' + R(10000000, 99999999), since: util.iso(util.addDays(T, -R(300, 2400))), creditLimit: R(2, 10) * 100000, sales, status: 'Active' }, { prefix: 'DLR', silent: true });
-    });
-
     // ---- check-ins (mobile sales) with location mapping
     const base = { lat: 11.0168, lng: 76.9558 };
     ex.forEach((s) => {
@@ -792,6 +945,7 @@
   const respBadge = (hrs) => (hrs == null ? h('span', { class: 'muted' }, '—') : ui.badge(hrsText(hrs), hrs <= 24 ? 'ok' : hrs <= 48 ? 'warn' : 'bad'));
   const fillSelect = (sel, opts) => { sel.innerHTML = ''; sel.appendChild(h('option', { value: '' }, 'Select…')); opts.forEach((o) => sel.appendChild(h('option', { value: typeof o === 'object' ? o.value : o }, typeof o === 'object' ? o.label : o))); };
   const execOptions = () => execs().map((s) => ({ value: s.id, label: s.name + ' · ' + (s.division || 'All') + ' · ' + (s.area || '—') }));
+  const dealerOptions = () => db.all('dealers').filter((d) => d.status !== 'Inactive').map((d) => ({ value: d.id, label: d.name + ' · ' + d.area + ' · ' + d.division }));
   const prodOptions = (div, cat) => master.products(div).filter((p) => !cat || p.category === cat).map((p) => ({ value: p.id, label: p.name + ' · ' + fmt.money(p.price) }));
   const card = (title, body, opts) => ui.card(title, body, opts);
   const section = (el, node) => { el.appendChild(h('div', { class: 'mt' }, node)); };
@@ -821,6 +975,7 @@
       { key: 'salesChannel', label: 'Source (sales channel)', type: 'select', options: CHANNELS, required: true, hint: 'Existing-customer business: OTS, walk-in, upsell/cross-sell · New-customer business: cold calling, digital, referral, ads, forums, walk-in' },
       { key: 'leadSource', label: 'Lead source', type: 'select', options: LEAD_SOURCES, required: true },
       { key: 'referralType', label: 'Referral type (Referral Sales)', type: 'select', options: REFERRAL_TYPES },
+      { key: 'dealerId', label: 'Dealer (dealer lead / dealer reference)', type: 'select', options: dealerOptions(), hint: 'Orders won from this lead count toward the dealer\'s monthly sales' },
       { key: 'sourceDetails', label: 'Source details', placeholder: 'Campaign, referrer name, OTS ref…' },
       { type: 'section', label: 'Requirement' },
       { key: 'division', label: 'Division', type: 'select', options: DIVS, required: true, default: div0, onChange: (val, inp) => { fillSelect(inp.category, categories(val)); fillSelect(inp.productId, prodOptions(val)); inp.siteVisitRequired.checked = val !== 'Power'; } },
@@ -833,19 +988,24 @@
       !isExec() ? { key: 'execId', label: 'Sales executive', type: 'select', options: [{ value: '', label: '⚙ Auto-assign by Division + Area' }].concat(execOptions()) } : null,
       { key: 'remarks', label: 'Remarks', type: 'textarea' },
     ].filter(Boolean);
+    // values that have no visible field (e.g. the Sales OTS id) are carried through — form.values() only returns fields
+    const hidden = { otsId: prefill.otsId || '' };
     let m;
     function proceed(v) {
+      Object.keys(hidden).forEach((k) => { if (hidden[k] && !v[k]) v[k] = hidden[k]; });
+      if ((v.leadSource === 'Dealer' || v.referralType === 'Dealer reference') && !v.dealerId) { ui.toast('Select the dealer for a dealer-sourced lead', 'bad'); return; }
+      if (v.otsId && db.one('enquiries', (x) => x.otsId === v.otsId)) { ui.toast('Sales OTS ' + v.otsId + ' is already converted (' + db.one('enquiries', (x) => x.otsId === v.otsId).id + ')', 'bad'); return; }
       if (!v.customerId) {
         const dup = findDuplicateCustomer(v);
         if (dup) {
-          ui.modal({ title: 'Duplicate check: customer already exists', body: h('div', { class: 'stack' }, [ui.callout('<b>' + util.esc(dup.name) + '</b> (' + dup.id + ') in the customer master matches this enquiry by name / phone / email. New accounts cannot be duplicated — link the enquiry to the existing customer.', 'warn'), ui.dl([['Customer', dup.name], ['Phone', dup.phone], ['Email', dup.email], ['Area', dup.area], ['Type', dup.type]])]),
+          ui.modal({ title: 'Duplicate check: customer already exists', body: h('div', { class: 'stack' }, [calloutH('<b>' + util.esc(dup.name) + '</b> (' + dup.id + ') in the customer master matches this enquiry by name / phone / email. New accounts cannot be duplicated — link the enquiry to the existing customer.', 'warn'), ui.dl([['Customer', dup.name], ['Phone', dup.phone], ['Email', dup.email], ['Area', dup.area], ['Type', dup.type]])]),
             actions: [{ label: 'Cancel' }, { label: 'Link to ' + dup.id + ' & continue', cls: 'primary', onClick: () => { Object.assign(v, { customerId: dup.id, accountName: dup.name, customerType: dup.type }); setTimeout(() => proceed(v)); } }] });
           return;
         }
       }
       const open = !v._dupOk && findOpenEnquiry(v);
       if (open) {
-        ui.modal({ title: 'Open enquiry already exists', body: ui.callout('<b>' + open.id + '</b> for ' + util.esc(open.accountName) + ' (' + util.esc(open.product) + ') is still open in ' + util.esc(open.division) + ' at stage <b>' + util.esc(open.stage) + '</b>, owned by ' + util.esc(execName(open.execId)) + '.', 'warn'),
+        ui.modal({ title: 'Open enquiry already exists', body: calloutH('<b>' + open.id + '</b> for ' + util.esc(open.accountName) + ' (' + util.esc(open.product) + ') is still open in ' + util.esc(open.division) + ' at stage <b>' + util.esc(open.stage) + '</b>, owned by ' + util.esc(execName(open.execId)) + '.', 'warn'),
           actions: [{ label: 'Open ' + open.id, onClick: () => { m.close(); CRM.go('enquiries', open.id); } }, { label: 'Create separate enquiry', cls: 'primary', onClick: () => { v._dupOk = true; setTimeout(() => proceed(v)); } }] });
         return;
       }
@@ -864,14 +1024,16 @@
       { key: 'contactName', label: 'Contact name', required: true }, { key: 'contactNumber', label: 'Contact number', required: true }, { key: 'email', label: 'Email' },
       { key: 'area', label: 'Area', type: 'select', options: master.areas, required: true }, { key: 'segment', label: 'Segment', type: 'select', options: master.segments }, { key: 'customerType', label: 'Customer type', type: 'select', options: CUSTOMER_TYPES },
       { key: 'salesChannel', label: 'Source (sales channel)', type: 'select', options: CHANNELS, required: true }, { key: 'leadSource', label: 'Lead source', type: 'select', options: LEAD_SOURCES, required: true },
-      { key: 'referralType', label: 'Referral type', type: 'select', options: REFERRAL_TYPES }, { key: 'sourceDetails', label: 'Source details' },
+      { key: 'referralType', label: 'Referral type', type: 'select', options: REFERRAL_TYPES }, { key: 'dealerId', label: 'Dealer', type: 'select', options: dealerOptions() }, { key: 'sourceDetails', label: 'Source details' },
       { key: 'quantity', label: 'Quantity', type: 'number', required: true }, { key: 'expectedValue', label: 'Expected value (₹)', type: 'number', required: true },
       { key: 'callStatus', label: 'Call status', type: 'select', options: CALL_STATUS }, { key: 'followUpStatus', label: 'Follow-up status', type: 'select', options: FU_STATUS },
       { key: 'nextFollowUp', label: 'Next follow-up date', type: 'date' }, { key: 'siteVisitDate', label: 'Site visit date', type: 'date' },
       { key: 'siteVisitRequired', label: 'Site visit required', type: 'checkbox' }, { key: 'progressNotes', label: 'Progress notes', type: 'textarea' }, { key: 'remarks', label: 'Remarks', type: 'textarea' },
     ], e, (v) => {
       if (v.nextFollowUp && v.nextFollowUp !== e.nextFollowUp && OPEN.includes(e.stage)) scheduleFollowUp(Object.assign({}, e, v), v.nextFollowUp, 'Call', 'Rescheduled from enquiry');
-      db.update('enquiries', e.id, v); ui.toast('Enquiry updated', 'ok'); CRM.refresh();
+      db.update('enquiries', e.id, v);
+      const o = orderOf(e.id); if (o && (v.dealerId || '') !== (o.dealerId || '')) db.update('orders', o.id, { dealerId: v.dealerId || '' }, { note: 'Dealer link updated from enquiry' });
+      ui.toast('Enquiry updated', 'ok'); CRM.refresh();
     }, { wide: true });
   }
 
@@ -936,25 +1098,94 @@
   }
 
   // ---------- Sales OTS (from Service) + assignment queue for the Sales Coordinator
+  // Service OTS record fields (service.js createOts): qty, value, brand, productType, capacity, contact, customerId, urgency, complaintId, createdBy, status
+  const isSalesOts = (o) => o.otsType === 'Sales OTS' || /sales/i.test(String(o.department || o.type || ''));
+  const otsEnquiry = (o) => db.one('enquiries', (e) => e.otsId === o.id);
+  const otsCustomer = (o) => master.customer(o.customerId) || (o.customerName ? master.customers().find((x) => x.name === o.customerName) : null) || {};
+  const otsQty = (o) => Number(o.qty != null ? o.qty : o.batteryQty) || 0;
+  const otsValue = (o) => Number(o.value != null ? o.value : o.estimatedValue) || 0;
   function pendingOts() {
-    return db.all('ots').filter((o) => /sales/i.test(String(o.otsType || o.type || o.department || '')) && !/won|lost|closed/i.test(String(o.status || '')) && !db.one('enquiries', (e) => e.otsId === o.id));
+    return db.all('ots').filter((o) => isSalesOts(o) && !/won|lost|closed/i.test(String(o.status || '')) && !otsEnquiry(o));
   }
   function convertOts(o) {
-    const bq = Number(o.batteryQty || o.quantity || 3);
-    const p = master.products().find((x) => x.category === 'Battery' && (o.batteryBrand ? x.name.toLowerCase().includes(String(o.batteryBrand).toLowerCase()) : true)) || master.products('Power')[0];
-    const c = master.customer(o.customerId) || master.customers().find((x) => x.name === o.customerName) || {};
-    enquiryForm({ customerId: c.id || '', accountName: c.name || o.customerName, contactNumber: o.contactNumber || c.phone, area: c.area, division: 'Power', category: 'Battery', productId: p.id, quantity: bq, expectedValue: o.estimatedValue || p.price * bq, salesChannel: 'OTS', leadSource: 'Existing Customer Business', sourceDetails: 'Sales OTS ' + o.id + (o.complaintId ? ' · complaint ' + o.complaintId : '') + ' · battery qty ' + bq + ' (> 2 → Sales OTS)', otsId: o.id, siteVisitRequired: false }, { title: 'Convert Sales OTS ' + o.id + ' to enquiry' });
+    if (otsEnquiry(o)) { ui.toast('Sales OTS ' + o.id + ' is already converted to ' + otsEnquiry(o).id, 'warn'); return; }
+    const bq = otsQty(o) || 3;
+    const brand = String(o.brand || o.batteryBrand || '').toLowerCase();
+    const bats = master.products().filter((x) => x.category === 'Battery');
+    const p = bats.find((x) => brand && x.name.toLowerCase().includes(brand) && (!o.capacity || x.name.toLowerCase().includes(String(o.capacity).toLowerCase()))) || bats.find((x) => brand && x.name.toLowerCase().includes(brand)) || bats[0] || master.products('Power')[0];
+    const c = otsCustomer(o);
+    enquiryForm({ customerId: c.id || '', accountName: c.name || o.customerName || '', contactNumber: o.contact || o.contactNumber || c.phone, area: c.area, division: 'Power', category: 'Battery', productId: p.id, quantity: bq, expectedValue: otsValue(o) || p.price * bq, salesChannel: 'OTS', leadSource: 'Existing Customer Business', sourceDetails: 'Sales OTS ' + o.id + (o.complaintId ? ' · complaint ' + o.complaintId : '') + ' · ' + bq + ' × ' + (o.productType || 'Battery') + ' ' + (o.brand || '') + ' ' + (o.capacity || '') + ' (> 2 → Sales OTS)' + (o.urgency ? ' · urgency ' + o.urgency : ''), otsId: o.id, siteVisitRequired: false, remarks: o.notes || '' }, { title: 'Convert Sales OTS ' + o.id + ' to enquiry' });
+  }
+  // OTS incentive (OTS §8): sales % on won value; shared case (engineer raised, executive closed) split by a configurable %
+  function otsIncentivePlan() {
+    const ic = cfg('sales.otsIncentive');
+    const svc = (db.get('serviceConfig', 'CFG') || {}).otsIncentive || {};
+    const salesPct = ic.salesPct != null && ic.salesPct !== '' ? Number(ic.salesPct) : (svc.salesPct != null ? Number(svc.salesPct) : 1.5);
+    const share = ic.engineerSharePct != null && ic.engineerSharePct !== '' ? Number(ic.engineerSharePct) : (svc.sharedSplit != null ? Number(svc.sharedSplit) : 50);
+    return { salesPct, engineerSharePct: share };
+  }
+  function otsIncentive(o) {
+    const e = otsEnquiry(o), ord = e && orderOf(e.id);
+    const won = ord && ord.approval !== 'Rejected';
+    const plan = otsIncentivePlan();
+    const revenue = won ? Number(ord.value) || 0 : 0;
+    const total = o.incentiveEligible === 'No' ? 0 : Math.round(revenue * plan.salesPct / 100);
+    const shared = !!(o.createdBy && e && e.execId && o.createdBy !== e.execId);
+    const eng = shared ? Math.round(total * plan.engineerSharePct / 100) : 0;
+    return { revenue, total, shared, engineer: o.createdBy || '', engineerAmt: eng, exec: e ? e.execId : '', execAmt: total - eng, pct: plan.salesPct, split: plan.engineerSharePct };
+  }
+  const otsRow = (o) => { const e = otsEnquiry(o), ord = e && orderOf(e.id), c = otsCustomer(o); return Object.assign({}, o, { cust: c.name || o.customerName || '—', q: otsQty(o), v: otsValue(o), enq: e, ord, execId: e ? e.execId : '', execName: e ? execName(e.execId) : 'Not assigned', stage: e ? e.stage : 'Awaiting assignment', age: util.hoursBetween(o.createdAt, new Date()), inc: otsIncentive(o) }); };
+  function renderSalesOts(el, params) {
+    const all = db.all('ots').filter(isSalesOts).map(otsRow).filter((r) => !isExec() || r.execId === me());
+    const pend = all.filter((r) => !r.enq && !/won|lost|closed/i.test(String(r.status || '')));
+    const prog = all.filter((r) => r.enq && OPEN.includes(r.enq.stage));
+    const won = all.filter((r) => r.enq && r.enq.stage === 'Order Won');
+    const lost = all.filter((r) => (r.enq && r.enq.stage === 'Order Lost') || (!r.enq && /lost/i.test(String(r.status || ''))));
+    const plan = otsIncentivePlan();
+    ui.page(el, { title: isExec() ? 'My Sales OTS' : 'Sales OTS Desk', sub: 'Opportunities raised by Service (battery qty > 2) → Sales Coordinator assigns → executive quotes, negotiates and books the order · outcome flows back to the Service OTS record', actions: [ui.btn('⇩ Export CSV', () => downloadCsv('sales-ots.csv', ['OTS', 'Created', 'Customer', 'Qty', 'Brand', 'Capacity', 'Est. value', 'Urgency', 'Complaint', 'Raised by', 'Enquiry', 'Executive', 'Stage', 'Order', 'Order value', 'Incentive total', 'Engineer share', 'Executive share'], all.map((r) => [r.id, util.iso(r.createdAt), r.cust, r.q, r.brand, r.capacity, r.v, r.urgency, r.complaintId, execName(r.createdBy), r.enq ? r.enq.id : '', r.execName, r.stage, r.ord ? (r.ord.soNumber || r.ord.id) : '', r.inc.revenue, r.inc.total, r.inc.engineerAmt, r.inc.execAmt])), 'sm')] });
+    el.appendChild(ui.kpis([
+      { label: 'Awaiting assignment', value: pend.length, meta: pend.filter((r) => r.age > 24).length + ' waiting > 24 h', color: 'var(--chart-4)' },
+      { label: 'In progress', value: prog.length, meta: fmt.lakh(sum(prog, 'v')) + ' estimated', color: 'var(--chart-5)' },
+      { label: 'Won (orders booked)', value: won.length, meta: fmt.lakh(sum(won, (r) => r.inc.revenue)), color: 'var(--ok)' },
+      { label: 'Lost', value: lost.length, color: 'var(--bad)' },
+      { label: 'Conversion', value: fmt.pct(util.pct(won.length, won.length + lost.length)) },
+      { label: 'Incentive (' + plan.salesPct + '% · shared ' + plan.engineerSharePct + '/' + (100 - plan.engineerSharePct) + ')', value: fmt.lakh(sum(won, (r) => r.inc.total)), color: 'var(--chart-2)' },
+    ]));
+    const otsLink = (o) => (canOpen('#/ots/' + o.id, CRM.role().id) ? h('a', { class: 'mono', href: '#/ots/' + o.id }, o.id) : mono(o.id));
+    const base = [{ key: 'id', label: 'OTS', render: otsLink }, { key: 'createdAt', label: 'Raised', render: (r) => fmt.date(r.createdAt) }, { key: 'cust', label: 'Customer', render: (r) => h('div', {}, [h('b', {}, r.cust), h('div', { class: 'small muted' }, (r.contact || '') + (r.complaintId ? ' · ' + r.complaintId : ''))]) }, { key: 'q', label: 'Requirement', render: (r) => r.q + ' × ' + (r.productType || 'Battery') + ' ' + (r.brand || '') + ' ' + (r.capacity || '') }, { key: 'v', label: 'Est. value', cls: 'right', render: (r) => fmt.money(r.v), footer: (rs) => fmt.lakh(sum(rs, 'v')) }, { key: 'urgency', label: 'Urgency', render: (r) => ui.badge(r.urgency || '—', /hot|high|urgent/i.test(r.urgency || '') ? 'bad' : 'warn') }, { key: 'createdBy', label: 'Raised by', render: (r) => execName(r.createdBy) }];
+    el.appendChild(ui.tabs([{ id: 'pend', label: 'Assignment queue', count: pend.length }, { id: 'prog', label: 'In progress', count: prog.length }, { id: 'won', label: 'Won & incentive', count: won.length }, { id: 'lost', label: 'Lost', count: lost.length }], (id, body) => {
+      if (id === 'pend') {
+        body.appendChild(calloutH('Each Sales OTS is an assignment task for the Sales Coordinator: convert it into an enquiry (auto- or manually assigned). The Service OTS record is updated through the <b>ots.converted</b> / <b>ots.outcome</b> events.', 'info'));
+        body.appendChild(h('div', { class: 'mt' }, card(null, ui.table({ rows: pend, empty: 'No Sales OTS waiting for assignment', columns: base.concat([{ key: 'age', label: 'Waiting', render: (r) => ui.badge(hrsText(r.age), r.age > 24 ? 'bad' : 'warn'), sort: (r) => r.age }]), actions: isCoord() ? (r) => [ui.btn('Convert & assign', () => convertOts(db.get('ots', r.id)), 'sm primary')] : null }), { flush: true })));
+      } else if (id === 'prog') {
+        body.appendChild(card(null, ui.table({ rows: prog, onRow: (r) => CRM.go('enquiries', r.enq.id), columns: base.concat([{ key: 'execName', label: 'Executive' }, { key: 'stage', label: 'Stage', render: (r) => stageBadge(r.stage) }, { key: 'nf', label: 'Next follow-up', render: (r) => fuBadge(r.enq.nextFollowUp) }]), actions: canWork() ? (r) => [!sentQuote(r.enq.id) ? ui.btn('Quote', () => quoteModal(db.get('enquiries', r.enq.id)), 'sm') : null, ui.btn('Book order', () => moveStage(db.get('enquiries', r.enq.id), 'Order Won'), 'sm ok')] : null }), { flush: true }));
+      } else if (id === 'won') {
+        body.appendChild(card('Orders booked from Sales OTS · incentive ' + plan.salesPct + '% of order value · shared case: engineer ' + plan.engineerSharePct + '% / executive ' + (100 - plan.engineerSharePct) + '%', ui.table({ rows: won, columns: [{ key: 'id', label: 'OTS', render: otsLink }, { key: 'cust', label: 'Customer' }, { key: 'ord', label: 'Order', render: (r) => (r.ord ? lnk('orders', r.ord.id) : '—') }, { key: 'rev', label: 'Order value', cls: 'right', render: (r) => fmt.money(r.inc.revenue), sort: (r) => r.inc.revenue, footer: (rs) => fmt.lakh(sum(rs, (r) => r.inc.revenue)) }, { key: 'createdBy', label: 'Engineer (raised)', render: (r) => execName(r.createdBy) }, { key: 'execName', label: 'Executive (closed)' }, { key: 'tot', label: 'Incentive', cls: 'right', render: (r) => fmt.money(r.inc.total), footer: (rs) => fmt.money(sum(rs, (r) => r.inc.total)) }, { key: 'eng', label: 'Engineer share', cls: 'right', render: (r) => (r.inc.shared ? fmt.money(r.inc.engineerAmt) : '—') }, { key: 'ex', label: 'Executive share', cls: 'right', render: (r) => fmt.money(r.inc.execAmt) }, { key: 'sp', label: 'Split', render: (r) => (r.inc.shared ? ui.badge('Shared ' + r.inc.split + '/' + (100 - r.inc.split), 'violet') : ui.badge('Single', 'info')) }] }), { flush: true, actions: isMgr() ? [ui.btn('Incentive rules', () => otsIncentiveModal(), 'sm')] : null }));
+      } else {
+        body.appendChild(card(null, ui.table({ rows: lost, columns: base.concat([{ key: 'execName', label: 'Executive' }, { key: 'lr', label: 'Lost reason', render: (r) => (r.enq ? r.enq.lostReason || '—' : r.lostReason || '—') }]) }), { flush: true }));
+      }
+    }, params && params[0] && !pend.some((r) => r.id === params[0]) ? 'prog' : 'pend'));
+  }
+  function otsIncentiveModal() {
+    const ic = cfg('sales.otsIncentive'), plan = otsIncentivePlan();
+    ui.formModal('Sales OTS incentive rules', [
+      { key: 'salesPct', label: 'Sales OTS incentive (% of order value) — blank = Service OTS setting', type: 'number', step: 'any', min: 0, max: 100 },
+      { key: 'engineerSharePct', label: 'Shared case: engineer share (%) — executive gets the rest', type: 'number', min: 0, max: 100, required: true },
+    ], { salesPct: ic.salesPct, engineerSharePct: plan.engineerSharePct }, (v) => {
+      if (v.engineerSharePct < 0 || v.engineerSharePct > 100 || (v.salesPct != null && (v.salesPct < 0 || v.salesPct > 100))) { ui.toast('Percentages must be between 0 and 100', 'bad'); return false; }
+      setCfg('sales.otsIncentive', { salesPct: v.salesPct, engineerSharePct: v.engineerSharePct }); ui.toast('Incentive rules saved', 'ok'); CRM.refresh();
+    });
   }
   function renderAssignment(body) {
     const unassigned = db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage));
-    body.appendChild(ui.callout('<b>Lead assignment automation:</b> new leads are routed to the Sales Executive whose <b>Division + Area</b> match; otherwise to the least-loaded executive in the division. <b>Sales OTS</b> (battery qty &gt; 2) raised by service engineers lands here for the Sales Coordinator to assign.', 'info'));
+    body.appendChild(calloutH('<b>Lead assignment automation:</b> new leads are routed to the Sales Executive whose <b>Division + Area</b> match; otherwise to the least-loaded executive in the division. <b>Sales OTS</b> (battery qty &gt; 2) raised by service engineers lands here for the Sales Coordinator to assign.', 'info'));
     body.appendChild(h('div', { class: 'mt' }, card('Leads awaiting assignment (' + unassigned.length + ')', ui.table({
       rows: unassigned, search: false, empty: 'No unassigned leads — every lead has an owner',
       columns: [{ key: 'id', label: 'Enquiry', render: (e) => lnk('enquiries', e.id) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (e) => ui.divTag(e.division) }, { key: 'area', label: 'Area' }, { key: 'salesChannel', label: 'Source' }, { key: 'sourceDetails', label: 'Details' }, { key: 'createdAt', label: 'Waiting', render: (e) => ui.badge(hrsText(util.hoursBetween(e.createdAt, new Date())), util.hoursBetween(e.createdAt, new Date()) > 24 ? 'bad' : 'warn') }, { key: 's', label: 'Rule suggests', render: (e) => { const a = autoAssign(e.division, e.area); return a.exec ? a.exec.name + ' · ' + a.rule : '—'; } }],
       actions: (e) => [ui.btn('Auto-assign', () => { const a = autoAssign(e.division, e.area); assignEnquiry(e, a.exec.id, a.rule); ui.toast(e.id + ' → ' + a.exec.name, 'ok'); CRM.refresh(); }, 'sm primary'), ui.btn('Choose…', () => reassignModal(e), 'sm')],
     }), { flush: true, actions: unassigned.length ? [ui.btn('Auto-assign all', () => { unassigned.forEach((e) => { const a = autoAssign(e.division, e.area); assignEnquiry(e, a.exec.id, a.rule); }); ui.toast(unassigned.length + ' leads assigned', 'ok'); CRM.refresh(); }, 'sm primary')] : null })));
-    const ots = pendingOts();
-    body.appendChild(h('div', { class: 'mt' }, card('Sales OTS from Service (' + ots.length + ')', ots.length ? ui.table({ rows: ots, search: false, columns: [{ key: 'id', label: 'OTS ID', render: (o) => mono(o.id) }, { key: 'customerName', label: 'Customer', render: (o) => o.customerName || custName(o) }, { key: 'batteryQty', label: 'Battery qty' }, { key: 'estimatedValue', label: 'Est. value', render: (o) => fmt.money(o.estimatedValue) }, { key: 'urgency', label: 'Urgency', render: (o) => ui.badge(o.urgency || '—', o.urgency === 'Hot' ? 'bad' : 'warn') }, { key: 'status', label: 'Status' }], actions: (o) => [ui.btn('Convert & assign', () => convertOts(o), 'sm primary')] }) : ui.empty('No Sales OTS pending. Service OTS with battery qty > 2 appear here automatically.', '🔧'), { flush: true })));
+    const ots = pendingOts().map(otsRow);
+    body.appendChild(h('div', { class: 'mt' }, card('Sales OTS from Service (' + ots.length + ')', ots.length ? ui.table({ rows: ots, search: false, columns: [{ key: 'id', label: 'OTS ID', render: (o) => mono(o.id) }, { key: 'cust', label: 'Customer' }, { key: 'q', label: 'Battery qty' }, { key: 'brand', label: 'Brand', render: (o) => [o.brand, o.capacity].filter(Boolean).join(' ') || '—' }, { key: 'v', label: 'Est. value', render: (o) => fmt.money(o.v) }, { key: 'urgency', label: 'Urgency', render: (o) => ui.badge(o.urgency || '—', /hot|high|urgent/i.test(o.urgency || '') ? 'bad' : 'warn') }, { key: 'age', label: 'Waiting', render: (o) => ui.badge(hrsText(o.age), o.age > 24 ? 'bad' : 'warn') }], actions: (o) => [ui.btn('Convert & assign', () => convertOts(db.get('ots', o.id)), 'sm primary')] }) : ui.empty('No Sales OTS pending. Service OTS with battery qty > 2 appear here automatically.', '🔧'), { flush: true, actions: [ui.btn('Sales OTS desk', () => CRM.go('salesots'), 'sm')] })));
     const matrix = h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, [h('th', {}, 'Area')].concat(DIVS.map((d) => h('th', {}, d))))), h('tbody', {}, master.areas.map((a) => h('tr', {}, [h('td', {}, h('b', {}, a))].concat(DIVS.map((d) => { const r = autoAssign(d, a); return h('td', {}, [r.exec ? r.exec.name : '—', h('div', { class: 'small muted' }, r.rule)]); })))))]);
     body.appendChild(h('div', { class: 'grid g2 mt' }, [card('Assignment matrix (Division × Area → Executive)', h('div', { class: 'table-wrap' }, matrix), { flush: true }), card('Executive workload (open leads)', ui.hbars(execs().map((s) => ({ label: s.name + ' · ' + (s.division || ''), value: openLoad(s.id) }))))]));
   }
@@ -975,13 +1206,13 @@
         ui.btn('Edit', () => editEnquiry(e), 'sm'),
         isCoord() ? ui.btn(e.execId ? 'Reassign' : 'Assign', () => reassignModal(e), 'sm') : null,
         open && nextStage ? ui.btn('Advance → ' + nextStage, () => moveStage(e, nextStage), 'primary') : null,
-        e.stage === 'Order Lost' && isMgr() ? ui.btn('Reopen', () => moveStage(e, 'Negotiation'), 'primary') : null,
+        e.stage === 'Order Lost' && isMgr() ? ui.btn('Reopen', () => moveStage(e, lostQuote(e.id) ? 'Negotiation' : 'Contact Made'), 'primary') : null,
       ] : []) });
     const steps = STAGES.slice(0, 6).concat([e.stage === 'Order Lost' ? 'Order Lost' : 'Order Won']);
     const cur = e.stage === 'Order Won' ? 7 : e.stage === 'Order Lost' ? 6 : STAGES.indexOf(e.stage);
     el.appendChild(card(null, ui.stepper(steps, cur, e.stage === 'Order Lost')));
     const breaches = policyBreaches().filter((b) => b.rec.id === e.id);
-    breaches.forEach((b) => el.appendChild(h('div', { class: 'mt' }, ui.callout('<b>' + b.type + ' (' + b.ref + ')</b> — ' + util.esc(b.details) + ' · escalated to ' + LEVELS[b.level].label, b.level >= 3 ? 'bad' : 'warn'))));
+    breaches.forEach((b) => el.appendChild(h('div', { class: 'mt' }, calloutH('<b>' + b.type + ' (' + b.ref + ')</b> — ' + util.esc(b.details) + ' · escalated to ' + LEVELS[b.level].label, b.level >= 3 ? 'bad' : 'warn'))));
     if (open && work) {
       const sel = h('select', {}, [h('option', { value: '' }, 'Move to stage…')].concat(STAGES.filter((s) => s !== e.stage).map((s) => h('option', { value: s }, s))));
       sel.addEventListener('change', () => { if (sel.value) moveStage(e, sel.value); sel.value = ''; });
@@ -996,7 +1227,7 @@
         ['Source details', [e.referralType, e.sourceDetails].filter(Boolean).join(' · ')], ['Segment', e.segment], ['Division', ui.divTag(e.division)], ['Category', e.category],
         ['Product', e.product], ['Quantity', e.quantity], ['Expected value', fmt.money(e.expectedValue)], ['Customer type', ui.badge(e.customerType)],
         ['Assignment', e.assignRule || '—'], ['Remarks', e.remarks],
-      ]))),
+      ].concat(e.otsId ? [['Sales OTS', canOpen('#/ots/' + e.otsId, CRM.role().id) ? lnk('ots', e.otsId) : e.otsId]] : [], e.dealerId ? [['Dealer', (db.get('dealers', e.dealerId) || {}).name || e.dealerId]] : [])))),
       h('div', { class: 'stack' }, [
         card('Pipeline status', ui.dl([['Sales stage', stageBadge(e.stage)], ['Call status', e.callStatus ? ui.badge(e.callStatus, e.callStatus === 'Connected' ? 'ok' : 'warn') : '—'], ['Site visit date', e.siteVisitDate ? fmt.date(e.siteVisitDate) + (e.siteVisitDoneAt ? ' ✓' : '') : (e.siteVisitRequired ? 'Required · not scheduled' : 'Not required')], ['Next follow-up', open ? fuBadge(e.nextFollowUp) : '—'], ['Follow-up status', ui.badge(e.followUpStatus || '—', e.followUpStatus === 'Missed' ? 'bad' : null)], ['Progress notes', e.progressNotes]].concat(e.stage === 'Order Lost' ? [['Lost reason', ui.badge(e.lostReason, 'bad')], ['Lost details', [e.competitor, e.lostDetails].filter(Boolean).join(' · ')]] : e.stage === 'Order Won' ? [['Won details', e.wonDetails]] : []))),
         card('Cycle times (auto)', ui.dl([['Quote response time', respBadge(resp)], ['Quote given date', q ? fmt.dateTime(q.quoteDate) : '—'], ['SO processing time', o ? respBadge(soProcessingHrs(o)) : '—'], ['Lead conversion time', o ? (conversionDays(o) + ' days') : open ? 'Open · ' + util.daysBetween(e.createdAt, CRM.TODAY) + ' days old' : '—']])),
@@ -1060,6 +1291,32 @@
   }
 
   // ============================================================ quotations
+  // Quotation documents: Core v2 file store (CRM.files) when present; fallback keeps files ≤ 1.5 MB in the salesFiles collection
+  const QUOTE_ACCEPT = '.pdf,.doc,.docx,.xls,.xlsx,.jpg,.jpeg,.png';
+  function storeQuoteFile(qid, file, note, onDone) {
+    const done = (meta) => { db.update('quotations', qid, Object.assign({ fileName: file.name, fileSize: file.size, fileType: file.type || '', fileAt: nowIso() }, meta || {}), { note: note || 'Quotation uploaded: ' + file.name }); if (onDone) onDone(); };
+    const local = () => {
+      if (file.size > 1.5e6) { ui.toast('File is larger than 1.5 MB — only the file name is recorded in this demo store', 'warn'); done({ fileId: '' }); return; }
+      const r = new FileReader();
+      r.onload = () => { const f = db.insert('salesFiles', { recordType: 'quotations', recordId: qid, name: file.name, type: file.type || '', size: file.size, data: r.result }, { prefix: 'SFL', silent: true }); done({ fileId: f.id }); };
+      r.onerror = () => done({ fileId: '' });
+      r.readAsDataURL(file);
+    };
+    if (CRM.files && CRM.files.add) {
+      // Core v2: files.add(file, meta) → Promise<attachment> (IndexedDB, 1.5 MB per file, versioned per label, access audited)
+      Promise.resolve().then(() => CRM.files.add(file, { recordType: 'quotations', recordId: qid, label: 'Quotation document', note: note || '' }))
+        .then((x) => done({ fileId: (x && x.id) || '', fileStore: 'core' }), (err) => ui.toast((err && err.message) || 'Could not store the file', 'bad'));
+      return;
+    }
+    local();
+  }
+  function openQuoteFile(q) {
+    if (q.fileStore === 'core' && CRM.files && CRM.files.open) { Promise.resolve(CRM.files.open(q.fileId)).catch((err) => ui.toast((err && err.message) || 'Could not open the file', 'bad')); return; }
+    const f = q.fileId && db.get('salesFiles', q.fileId);
+    if (!f || !f.data) { ui.toast('Only the file name was recorded for this quotation', 'warn'); return; }
+    const a = h('a', { href: f.data, download: f.name, target: '_blank', rel: 'noopener' }); document.body.appendChild(a); a.click(); a.remove();
+  }
+  const quoteFileLink = (q) => (!q.fileName ? '—' : q.fileId ? h('a', { href: '#', onClick: (ev) => { ev.preventDefault(); openQuoteFile(q); } }, '📎 ' + q.fileName) : h('span', {}, '📎 ' + q.fileName));
   function quoteTable(rows, opts) {
     opts = opts || {};
     return ui.table({
@@ -1101,7 +1358,7 @@
       { id: 'appr', label: 'Customer approved', count: list.filter((q) => q.status === 'Approved').length }, { id: 'rej', label: 'Rejected', count: list.filter((q) => q.status === 'Rejected').length },
     ], (id, body) => {
       const rows = id === 'await' ? awaiting : id === 'resp' ? pendingResp : id === 'appr' ? list.filter((q) => q.status === 'Approved') : id === 'rej' ? list.filter((q) => q.status === 'Rejected') : list;
-      if (id === 'await' && isMgr() && awaiting.length) body.appendChild(ui.callout('Approve or send back each quotation. Approval auto-sets the <b>Quote Given Date</b>, moves the enquiry to <b>Quotation Sent</b> and starts the customer-response clock.', 'warn'));
+      if (id === 'await' && isMgr() && awaiting.length) body.appendChild(calloutH('Approve or send back each quotation. Approval auto-sets the <b>Quote Given Date</b>, moves the enquiry to <b>Quotation Sent</b> and starts the customer-response clock.', 'warn'));
       body.appendChild(h('div', { class: id === 'await' ? 'mt' : '' }, card(null, quoteTable(rows), { flush: true })));
     }, params && params[0] && (db.get('quotations', params[0]) || {}).approval === 'Awaiting Approval' ? 'await' : 'all'));
     if (params && params[0]) { const q = db.get('quotations', params[0]); if (q && (!isExec() || q.execId === me())) setTimeout(() => quoteDrawer(q), 30); }
@@ -1113,15 +1370,16 @@
     if (!e && !options.length) { ui.toast('No open, assigned enquiries to quote against', 'warn'); return; }
     if (e && !e.execId) { ui.toast('Assign the enquiry to an executive before quoting', 'bad'); return; }
     e = e || options[0];
-    if (!existing && quotesOf(e.id).some((q) => q.approval === 'Awaiting Approval')) { ui.toast('A quotation for ' + e.id + ' is already awaiting manager approval', 'warn'); }
+    if (!existing && quotesOf(e.id).some((q) => q.approval === 'Awaiting Approval')) { ui.toast('A quotation for ' + e.id + ' is already awaiting manager approval — revise that one instead', 'warn'); return; }
+    const discMax = Number(cfg('sales.discount').justifyAbovePct) || 0;
     const defLines = (en) => { const p = master.product(en.productId); return p ? [{ productId: p.id, name: p.name, qty: en.quantity, rate: p.price }] : []; };
     let lines = existing ? util.clone(existing.lines || []) : defLines(e);
     const linesHost = h('div'), totals = h('div', { class: 'callout', style: 'margin-top:10px' });
     let form;
     const vals = () => (form ? form.values() : {});
     function updTotals() {
-      const v = vals(); const t = computeQuote(lines, v.discountPct, v.scrapValue);
-      totals.innerHTML = 'Gross ' + fmt.money(t.gross) + ' · Discount ' + (v.discountPct || 0) + '% · <b>Basic value ' + fmt.money(t.basicValue) + '</b> · GST 18% ' + fmt.money(t.gst) + (v.scrapValue ? ' · Scrap buy-back −' + fmt.money(v.scrapValue) : '') + ' · <b>Quote value ' + fmt.money(t.quoteValue) + '</b>' + ((v.discountPct || 0) > 10 ? '<br><b style="color:var(--bad)">Discount beyond 10% — justification required in remarks.</b>' : '');
+      const v = vals(); const t = computeQuote(lines, v.discountPct, v.scrapValue, e.division);
+      totals.innerHTML = 'Gross ' + fmt.money(t.gross) + ' · Discount ' + (v.discountPct || 0) + '% · <b>Basic value ' + fmt.money(t.basicValue) + '</b> · GST ' + t.gstPct + '% (' + util.esc(e.division) + ') ' + fmt.money(t.gst) + (v.scrapValue ? ' · Scrap buy-back −' + fmt.money(v.scrapValue) : '') + ' · <b>Quote value ' + fmt.money(t.quoteValue) + '</b>' + ((v.discountPct || 0) > discMax ? '<br><b style="color:var(--bad)">Discount beyond ' + discMax + '% — justification required in remarks.</b>' : '');
     }
     function drawLines() {
       linesHost.innerHTML = '';
@@ -1161,7 +1419,7 @@
     ];
     form = ui.form(fields, existing || {});
     const file = h('input', { type: 'file', accept: '.pdf,.doc,.docx,.xls,.xlsx,.jpg,.png' });
-    const body = h('div', {}, [h('h3', { style: 'margin-bottom:8px' }, 'Product details & quantity'), linesHost, totals, h('div', { class: 'mt' }, form), h('div', { class: 'field mt' }, [h('label', {}, 'Quotation document (upload — file name stored)' + (existing && existing.fileName ? ' · current: ' + existing.fileName : '')), file])]);
+    const body = h('div', {}, [h('h3', { style: 'margin-bottom:8px' }, 'Product details & quantity'), linesHost, totals, h('div', { class: 'mt' }, form), h('div', { class: 'field mt' }, [h('label', {}, 'Quotation document (PDF / Word / Excel / image — stored with the quotation)' + (existing && existing.fileName ? ' · current: ' + existing.fileName : '')), file])]);
     drawLines();
     ui.modal({ title: existing ? 'Revise quotation ' + existing.id : 'New quotation', sub: 'Submitted for Sales Manager approval', wide: true, body, actions: [{ label: 'Cancel' }, { label: existing ? 'Save revision & resubmit' : 'Submit for approval', cls: 'primary', onClick: () => {
       if (!form.validate()) return false;
@@ -1169,14 +1427,15 @@
       const good = lines.filter((l) => l.productId && l.qty > 0 && l.rate > 0);
       if (!good.length) { ui.toast('Add at least one product line with quantity and rate', 'bad'); return false; }
       if (v.scrapApplicable === 'Yes' && (!v.scrapType || !v.scrapQty)) { ui.toast('Scrap type and quantity are mandatory when scrap is applicable', 'bad'); return false; }
-      if ((v.discountPct || 0) > 10 && !String(v.remarks || '').trim()) { ui.toast('Discount beyond 10% needs a justification in remarks', 'bad'); return false; }
+      if ((v.discountPct || 0) > discMax && !String(v.remarks || '').trim()) { ui.toast('Discount beyond ' + discMax + '% needs a justification in remarks', 'bad'); return false; }
       delete v.enquiryRef; delete v.quoteDateInfo;
       const en = v.enquiryId ? db.get('enquiries', v.enquiryId) : e;
-      const t = computeQuote(good, v.discountPct, v.scrapValue);
-      const rec = Object.assign(v, t, { lines: good, enquiryId: en.id, customerId: en.customerId, accountName: en.accountName, division: en.division, execId: en.execId, approval: 'Awaiting Approval', status: 'Pending', quoteDate: '', customerApprovedAt: '', fileName: file.files[0] ? file.files[0].name : (existing ? existing.fileName : '') });
+      const t = computeQuote(good, v.discountPct, v.scrapValue, en.division);
+      const rec = Object.assign(v, t, { lines: good, enquiryId: en.id, customerId: en.customerId, accountName: en.accountName, division: en.division, execId: en.execId, approval: 'Awaiting Approval', status: 'Pending', quoteDate: '', customerApprovedAt: '', fileName: existing ? existing.fileName || '' : '' });
       let q;
       if (existing) { rec.revision = (existing.revision || 0) + 1; q = db.update('quotations', existing.id, rec, { note: 'Quotation revised (R' + rec.revision + ') and resubmitted' }); }
       else { rec.revision = 0; q = db.insert('quotations', rec, { prefix: 'QTN', note: 'Quotation submitted for approval' }); }
+      if (file.files[0]) storeQuoteFile(q.id, file.files[0]);
       submitQuote(q);
       ui.toast(q.id + (isMgr() ? ' approved & sent' : ' submitted for Sales Manager approval'), 'ok');
       CRM.refresh();
@@ -1189,17 +1448,18 @@
     const step = q.approval === 'Awaiting Approval' ? 1 : q.approval === 'Rejected' ? 1 : ['Approved', 'Rejected'].includes(q.status) ? 4 : 2;
     const work = canWork();
     const statusRow = work && q.approval === 'Approved' ? h('div', { class: 'row' }, [h('span', { class: 'small muted' }, 'Customer status:')].concat(QUOTE_STATUS.filter((s) => s !== q.status).map((s) => ui.btn(s, () => { d.close(); setQuoteStatus(q, s); }, 'sm' + (s === 'Approved' ? ' ok' : s === 'Rejected' ? ' danger' : ''))))) : null;
-    const upload = h('input', { type: 'file', style: 'max-width:220px' });
-    upload.addEventListener('change', () => { if (upload.files[0]) { db.update('quotations', q.id, { fileName: upload.files[0].name }, { note: 'Quotation uploaded: ' + upload.files[0].name }); ui.toast('Quotation file attached', 'ok'); d.close(); quoteDrawer(db.get('quotations', q.id)); } });
+    const upload = h('input', { type: 'file', accept: QUOTE_ACCEPT, style: 'max-width:220px' });
+    upload.addEventListener('change', () => { if (upload.files[0]) storeQuoteFile(q.id, upload.files[0], null, () => { ui.toast('Quotation file attached', 'ok'); d.close(); quoteDrawer(db.get('quotations', q.id)); }); });
     const msg = 'Dear ' + (e.contactName || 'Sir/Madam') + ', please find our quotation ' + q.id + ' for ' + (q.lines || []).map((l) => l.name + ' x ' + l.qty).join(', ') + '. Quote value ' + fmt.money(q.quoteValue) + ' (incl. GST), delivery by ' + fmt.date(q.deliveryCommitment) + '. – Maruthi Power Control Systems';
     const body = h('div', { class: 'stack' }, [
       ui.stepper(['Drafted', 'Manager approval', 'Sent to customer', 'Customer decision'], step, q.approval === 'Rejected' || q.status === 'Rejected'),
-      q.approval === 'Rejected' ? ui.callout('<b>Sent back by Sales Manager:</b> ' + util.esc(q.approvalRemarks || ''), 'bad') : null,
-      q.approval === 'Awaiting Approval' ? ui.callout('Awaiting Sales Manager approval — the quote given date and response time are set on approval.', 'warn') : null,
+      q.approval === 'Rejected' ? calloutH('<b>Sent back by Sales Manager:</b> ' + util.esc(q.approvalRemarks || ''), 'bad') : null,
+      q.approval === 'Awaiting Approval' ? calloutH('Awaiting Sales Manager approval — the quote given date and response time are set on approval.', 'warn') : null,
       statusRow,
-      ui.dl([['Quote No', q.id + (q.revision ? ' (R' + q.revision + ')' : '')], ['Enquiry', lnk('enquiries', q.enquiryId)], ['Account', q.accountName], ['Division', ui.divTag(q.division)], ['Quote given date (auto)', q.quoteDate ? fmt.dateTime(q.quoteDate) : '—'], ['Quote response time (auto)', respBadge(quoteResponseHrs(q))], ['Quotation status', ui.badge(q.status)], ['Approval', ui.badge(q.approval) ], ['Approved by', q.approvedBy ? q.approvedBy + ' · ' + fmt.dateTime(q.approvedAt) : '—'], ['Customer approved', q.customerApprovedAt ? fmt.dateTime(q.customerApprovedAt) : '—'], ['Basic value', fmt.money(q.basicValue)], ['GST 18%', fmt.money(q.gst)], ['Quote value', h('b', {}, fmt.money(q.quoteValue))], ['Discount', (q.discountPct || 0) + '%'], ['Warranty contract', q.warrantyContract], ['Delivery commitment', fmt.date(q.deliveryCommitment)], ['Payment terms', q.paymentTerms], ['Validity', (q.validityDays || 15) + ' days'], ['Scrap details', q.scrapApplicable === 'Yes' ? q.scrapQty + ' × ' + q.scrapType + ' · buy-back ' + fmt.money(q.scrapValue) + (q.scrapDetails ? ' · ' + q.scrapDetails : '') : 'Not applicable'], ['Document', q.fileName || '—'], ['Remarks', q.remarks]]),
+      ui.dl([['Quote No', q.id + (q.revision ? ' (R' + q.revision + ')' : '')], ['Enquiry', lnk('enquiries', q.enquiryId)], ['Account', q.accountName], ['Division', ui.divTag(q.division)], ['Quote given date (auto)', q.quoteDate ? fmt.dateTime(q.quoteDate) : '—'], ['Quote response time (auto)', respBadge(quoteResponseHrs(q))], ['Quotation status', ui.badge(q.status)], ['Approval', ui.badge(q.approval) ], ['Approved by', q.approvedBy ? q.approvedBy + ' · ' + fmt.dateTime(q.approvedAt) : '—'], ['Customer approved', q.customerApprovedAt ? fmt.dateTime(q.customerApprovedAt) : '—'], ['Basic value', fmt.money(q.basicValue)], ['GST ' + quoteGstPct(q) + '%', fmt.money(q.gst)], ['Quote value', h('b', {}, fmt.money(q.quoteValue))], ['Discount', (q.discountPct || 0) + '%'], ['Warranty contract', q.warrantyContract], ['Delivery commitment', fmt.date(q.deliveryCommitment)], ['Payment terms', q.paymentTerms], ['Validity', (q.validityDays || 15) + ' days'], ['Scrap details', q.scrapApplicable === 'Yes' ? q.scrapQty + ' × ' + q.scrapType + ' · buy-back ' + fmt.money(q.scrapValue) + (q.scrapDetails ? ' · ' + q.scrapDetails : '') : 'Not applicable'], ['Document', quoteFileLink(q)], ['Remarks', q.remarks]]),
       card('Product details', h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, ['Product', 'Qty', 'Rate', 'Amount'].map((x) => h('th', {}, x)))), h('tbody', {}, (q.lines || []).map((l) => h('tr', {}, [h('td', {}, l.name), h('td', {}, l.qty), h('td', { class: 'right' }, fmt.money(l.rate)), h('td', { class: 'right' }, fmt.money(l.qty * l.rate))])))]), { flush: true }),
-      work ? h('div', { class: 'row' }, [h('span', { class: 'small muted' }, 'Upload quotation:'), upload].concat(q.approval === 'Approved' ? commButtons(e, msg, 'Quotation ' + q.id + ' – Maruthi Power Control Systems') : [])) : null,
+      work ? h('div', { class: 'row' }, (ui.attachments ? [] : [h('span', { class: 'small muted' }, 'Upload quotation:'), upload]).concat(q.approval === 'Approved' ? commButtons(e, msg, 'Quotation ' + q.id + ' – Maruthi Power Control Systems') : [])) : null,
+      ui.attachments ? ui.attachments('quotations', q.id, { roles: ['sales_exec', 'sales_coordinator', 'sales_manager', 'admin'], labels: ['Quotation document', 'Customer PO', 'Technical proposal'], title: 'Quotation documents', accept: QUOTE_ACCEPT, onChange: (list) => { const doc = list.find((a) => /quotation/i.test(a.label)) || list[0]; if (doc && doc.id !== q.fileId) db.update('quotations', q.id, { fileName: doc.name, fileId: doc.id, fileStore: 'core' }, { note: 'Quotation document attached: ' + doc.name }); } }) : null,
       h('h3', {}, 'Audit trail'), ui.auditTrail('quotations', q.id),
     ]);
     const actions = [];
@@ -1246,20 +1506,41 @@
       { label: 'To be invoiced', value: live.filter((o) => o.approval === 'Approved' && !invoicesOf(o.id).length).length, color: 'var(--bad)' },
     ]));
     el.appendChild(ui.tabs([{ id: 'all', label: 'Live orders', count: live.length }, { id: 'await', label: 'SO approval', count: awaiting.length }, { id: 'del', label: 'Delivery & installation', count: delivery.length }, { id: 'hist', label: 'Migrated history', count: list.length - live.length }], (id, body) => {
-      if (id === 'del') { body.appendChild(card(null, ui.table({ rows: delivery, onRow: (o) => orderDrawer(db.get('orders', o.id)), columns: [{ key: 'soNumber', label: 'SO', render: (o) => mono(o.soNumber) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (o) => ui.divTag(o.division) }, { key: 'product', label: 'Product' }, { key: 'materialAvailability', label: 'Material', render: (o) => ui.badge(o.materialAvailability, /stock/.test(o.materialAvailability) ? 'ok' : 'warn') }, { key: 'deliveryCommitDate', label: 'Delivery commitment', render: (o) => ui.badge(fmt.date(o.deliveryCommitDate), o.deliveryCommitDate < todayIso() ? 'bad' : 'info') }, { key: 'installationStatus', label: 'Installation', render: (o) => ui.badge(o.installationStatus) }, { key: 'p', label: 'Project / job', render: (o) => { const p = linkedProject(o); return p ? p.id + ' · ' + (p.stage || p.status || '') : (o.division === 'Power' ? 'Service asset' : '—'); } }] }), { flush: true })); return; }
+      if (id === 'del') { body.appendChild(card(null, ui.table({ rows: delivery, onRow: (o) => orderDrawer(db.get('orders', o.id)), columns: [{ key: 'soNumber', label: 'SO', render: (o) => mono(o.soNumber) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (o) => ui.divTag(o.division) }, { key: 'product', label: 'Product' }, { key: 'materialAvailability', label: 'Material', render: (o) => ui.badge(o.materialAvailability, /stock/.test(o.materialAvailability) ? 'ok' : 'warn') }, { key: 'deliveryCommitDate', label: 'Delivery commitment', render: (o) => ui.badge(fmt.date(o.deliveryCommitDate), o.deliveryCommitDate < todayIso() ? 'bad' : 'info') }, { key: 'installationStatus', label: 'Installation', render: (o) => ui.badge(o.installationStatus) }, { key: 'p', label: 'Project / job stage', render: projectCell }] }), { flush: true })); return; }
       const rows = id === 'await' ? awaiting : id === 'hist' ? list.filter((o) => o.migrated) : live;
       body.appendChild(card(null, orderTable(rows), { flush: true }));
     }, params && params[0] && (db.get('orders', params[0]) || {}).approval === 'Awaiting Approval' ? 'await' : 'all'));
     if (params && params[0]) { const o = db.get('orders', params[0]); if (o && (!isExec() || o.execId === me())) setTimeout(() => orderDrawer(o), 30); }
   }
   const linkedProject = (o) => db.all('projects').find((p) => p.orderId === o.id || (o.soNumber && p.soNumber === o.soNumber));
+  // Read-only view of the project's current stage for Sales (projects.js owns the workflow; CRM.projects.stageInfo preferred when exposed)
+  const PRJ_WF = {
+    es_large: [['so', 'SO receipt'], ['survey', 'Site survey'], ['boq', 'BOQ'], ['procurement', 'Procurement'], ['delivery', 'Material delivery'], ['planning', 'Installation planning'], ['cable', 'Cable laying'], ['nvr', 'DVR / NVR'], ['cameras', 'Camera installation'], ['testing', 'Config / Testing / Commissioning'], ['handover', 'Handover / Closure']],
+    es_small: [['so', 'SO received & job created'], ['scope', 'Scope & site verified'], ['survey', 'Site visit (if required)'], ['boq', 'BOQ / material list'], ['procurement', 'Stock & purchase'], ['delivery', 'Material issued & scheduled'], ['install', 'Cable & device installation'], ['testing', 'DVR/NVR config & testing'], ['handover', 'Demo & handover'], ['activate', 'Asset / warranty / PM activation']],
+    solar: [['so', 'SO receipt'], ['survey', 'Site visit & feasibility'], ['boq', 'BOQ'], ['procurement', 'Purchase & material planning'], ['delivery', 'Dispatch & site verification'], ['planning', 'Installation planning'], ['civil', 'Civil work'], ['mechanical', 'Mechanical installation'], ['electrical', 'Electrical installation'], ['commissioning', 'Testing & commissioning'], ['compliance', 'Net metering & subsidy'], ['handover', 'Customer handover']],
+    es_pending: [['so', 'SO receipt / classification']],
+  };
+  function projectStage(p) {
+    if (CRM.projects && typeof CRM.projects.stageInfo === 'function') { try { const x = CRM.projects.stageInfo(p); if (x && x.label) return x; } catch (err) { /* fall back */ } }
+    const wf = PRJ_WF[p.kind] || [];
+    const i = wf.findIndex(([k]) => { const x = (p.stages || {})[k]; return !(x && (x.status === 'Completed' || x.status === 'Skipped')); });
+    const idx = i < 0 ? wf.length : i;
+    return { label: ['Closed', 'Cancelled'].includes(p.status) ? p.status : i < 0 ? 'All stages complete' : wf[i][1], pct: wf.length ? Math.round(idx / wf.length * 100) : 0, step: Math.min(idx + 1, wf.length), steps: wf.length };
+  }
+  function projectCell(o) {
+    const p = linkedProject(o);
+    if (!p) return o.division === 'Power' ? 'Power order → Service asset & PM' : o.approval === 'Approved' ? 'Project being created' : '—';
+    const st = projectStage(p);
+    const ref = canOpen('#/projects/' + p.id, CRM.role().id) ? lnk('projects', p.id) : mono(p.id);
+    return h('div', {}, [ref, ' · ', h('b', {}, st.label), h('div', { class: 'small muted' }, (st.steps ? 'Stage ' + st.step + ' of ' + st.steps + ' · ' : '') + (st.pct != null ? st.pct + '% complete' : '') + (p.status ? ' · ' + p.status : ''))]);
+  }
   function orderSummary(o) {
     const invs = invoicesOf(o.id);
     return h('div', { class: 'stack' }, [
       card(null, ui.stepper(ORDER_STEPS, orderStep(o), o.approval === 'Rejected')),
       h('div', { class: 'grid g2' }, [
         card('Order', ui.dl([['Order', o.id], ['SO number', o.soNumber || '—'], ['PO number', o.poNumber], ['Order won date', fmt.date(o.wonDate)], ['SO issued date', fmt.date(o.soIssuedDate)], ['SO processing time', respBadge(soProcessingHrs(o))], ['Material availability', o.materialAvailability], ['Value', fmt.money(o.value)], ['Payment terms', o.paymentTerms], ['Approval', ui.badge(o.approval)]])),
-        card('Installation / delivery & payment', ui.dl([['Delivery commitment', fmt.date(o.deliveryCommitDate)], ['Delivered', fmt.date(o.deliveredDate)], ['Installation completion', fmt.date(o.installationCompletionDate)], ['Installation status', ui.badge(o.installationStatus)], ['Invoices', invs.map((i) => i.invoiceNo).join(', ') || 'Not invoiced'], ['Invoice value', fmt.money(sum(invs, 'value'))], ['Received', fmt.money(sum(invs, paidOf))], ['Outstanding', h('b', {}, fmt.money(sum(invs, outstandingOf)))]])),
+        card('Installation / delivery & payment', ui.dl([['Delivery commitment', fmt.date(o.deliveryCommitDate)], ['Delivered', fmt.date(o.deliveredDate)], ['Installation completion', fmt.date(o.installationCompletionDate)], ['Installation status', ui.badge(o.installationStatus)], ['Project / job stage', projectCell(o)], ['Invoices', invs.map((i) => i.invoiceNo).join(', ') || 'Not invoiced'], ['Invoice value', fmt.money(sum(invs, 'value'))], ['Received', fmt.money(sum(invs, paidOf))], ['Outstanding', h('b', {}, fmt.money(sum(invs, outstandingOf)))]])),
       ]),
       ui.btn('Open order details', () => orderDrawer(o), 'sm'),
     ]);
@@ -1267,17 +1548,16 @@
   function orderDrawer(o) {
     if (!o) return;
     const invs = invoicesOf(o.id);
-    const proj = linkedProject(o);
     const work = canWork();
     const body = h('div', { class: 'stack' }, [
       ui.stepper(ORDER_STEPS, orderStep(o), o.approval === 'Rejected'),
-      o.approval === 'Awaiting Approval' ? ui.callout('Awaiting <b>Sales Manager approval</b>. On approval the SO number is issued and the order is handed over (' + (o.division === 'Power' ? 'Service: asset, warranty & PM plan' : 'Projects: ' + o.division + ' job') + ').', 'warn') : null,
-      o.approval === 'Rejected' ? ui.callout('<b>SO rejected:</b> ' + util.esc(o.approvalRemarks || ''), 'bad') : null,
+      o.approval === 'Awaiting Approval' ? calloutH('Awaiting <b>Sales Manager approval</b>. On approval the SO number is issued and the order is handed over (' + (o.division === 'Power' ? 'Service: asset, warranty & PM plan' : 'Projects: ' + o.division + ' job') + ').', 'warn') : null,
+      o.approval === 'Rejected' ? calloutH('<b>SO rejected:</b> ' + util.esc(o.approvalRemarks || ''), 'bad') : null,
       ui.dl([['Order', o.id], ['Enquiry', o.enquiryId ? lnk('enquiries', o.enquiryId) : 'Migrated'], ['Customer', o.customerId ? lnk('customer360', o.customerId) : o.accountName], ['Division', ui.divTag(o.division)], ['Product', o.product + ' × ' + o.quantity], ['Order value (ex-GST)', fmt.money(o.value)],
         o.cameraCount ? ['Camera count', o.cameraCount] : null, o.systemType ? ['System type', o.systemType] : null, o.capacityKw ? ['Capacity', o.capacityKw + ' kW'] : null,
         ['Order won date', fmt.dateTime(o.wonDate)], ['Sales order number', o.soNumber || '—'], ['PO number', o.poNumber], ['SO issued date', fmt.dateTime(o.soIssuedDate)], ['SO processing time (auto)', respBadge(soProcessingHrs(o))], ['Lead conversion time', conversionDays(o) != null ? conversionDays(o) + ' days' : '—'], ['Material availability', o.materialAvailability], ['Payment terms', o.paymentTerms], ['Warranty contract', o.warrantyContract], ['Approved by', o.approvedBy || '—'], ['Executive', execName(o.execId)]]),
       h('h3', {}, 'Installation / delivery tracking'),
-      ui.dl([['Delivery commitment date', fmt.date(o.deliveryCommitDate)], ['Delivered date', fmt.date(o.deliveredDate)], ['Installation completion date', fmt.date(o.installationCompletionDate)], ['Installation status', ui.badge(o.installationStatus)], ['Scrap', o.scrapApplicable ? o.scrapQty + ' × ' + o.scrapType + ' · ' + (o.scrapCollected ? 'collected' : 'pending collection') : 'Not applicable'], ['Project / job', proj ? proj.id + ' · ' + (proj.stage || proj.status || '') : o.division === 'Power' ? 'Power order → Service asset & PM' : '—']]),
+      ui.dl([['Delivery commitment date', fmt.date(o.deliveryCommitDate)], ['Delivered date', fmt.date(o.deliveredDate)], ['Installation completion date', fmt.date(o.installationCompletionDate)], ['Installation status', ui.badge(o.installationStatus)], ['Scrap', o.scrapApplicable ? o.scrapQty + ' × ' + o.scrapType + ' · ' + (o.scrapCollected ? 'collected' : 'pending collection') : 'Not applicable'], ['Project / job stage', projectCell(o)]].concat(o.dealerId ? [['Dealer', (db.get('dealers', o.dealerId) || {}).name || o.dealerId]] : [], o.otsId ? [['Sales OTS', o.otsId]] : [])),
       h('h3', {}, 'Invoices & payments'),
       invs.length ? ui.table({ rows: invs, search: false, columns: [{ key: 'invoiceNo', label: 'Invoice', render: (i) => mono(i.invoiceNo) }, { key: 'invoiceDate', label: 'Date', render: (i) => fmt.date(i.invoiceDate) }, { key: 'value', label: 'Value', render: (i) => fmt.money(i.value) }, { key: 'dueDate', label: 'Due', render: (i) => fmt.date(i.dueDate) }, { key: 'o', label: 'Outstanding', render: (i) => fmt.money(outstandingOf(i)) }, { key: 's', label: 'Status', render: (i) => ui.badge(invStatus(i), invTone(invStatus(i))) }] }) : ui.empty('Not invoiced yet — Accounts raises the invoice after SO approval', '🧾'),
       h('h3', {}, 'Audit trail'), ui.auditTrail('orders', o.id),
@@ -1373,7 +1653,7 @@
     allFu().filter((f) => f.status === 'Planned' && f.dueDate <= t).sort((a, b) => (a.dueDate > b.dueDate ? 1 : -1)).forEach((f) => out.push({ kind: f.dueDate < t ? 'Missed follow-up' : 'Follow-up', tone: f.dueDate < t ? 'bad' : 'warn', title: f.accountName + ' — ' + f.purpose, sub: f.type + ' · ' + fmt.rel(f.dueDate) + ' · ' + execName(f.execId), link: '#/enquiries/' + f.enquiryId, fu: f }));
     allEnq().filter((e) => OPEN.includes(e.stage) && e.siteVisitDate === t && !e.siteVisitDoneAt).forEach((e) => out.push({ kind: 'Site visit', tone: 'info', title: e.accountName + ' — site visit', sub: e.area + ' · ' + e.product, link: '#/enquiries/' + e.id }));
     policyBreaches().filter((b) => b.type === 'Quotation Delay' && (!isExec() || b.owner === me())).forEach((b) => out.push({ kind: 'Quotation due', tone: 'bad', title: b.rec.accountName + ' — submit quotation', sub: Math.round(b.over + 24) + ' h since enquiry (SLA 24 h)', link: b.link }));
-    allInvoices().filter((i) => outstandingOf(i) > 0 && util.iso(i.dueDate) === t).forEach((i) => out.push({ kind: 'Collect payment', tone: 'warn', title: i.accountName + ' — ' + fmt.money(outstandingOf(i)), sub: i.invoiceNo + ' due today', link: '#/payments' }));
+    allInvoices().filter((i) => outstandingOf(i) > 0 && util.iso(i.dueDate) === t).forEach((i) => out.push({ kind: 'Collect payment', tone: 'warn', title: i.accountName + ' — ' + fmt.money(outstandingOf(i)), sub: i.invoiceNo + ' due today', link: ['#/payments', i.orderId ? '#/orders/' + i.orderId : '#/mobile'].find((l) => canOpen(l, CRM.role().id)) }));
     return out;
   }
   function taskList(tasks, limit) {
@@ -1404,9 +1684,9 @@
       } else if (id === 'sched') {
         const days = [0, 1, 2, 3, 4, 5, 6].map((d) => util.iso(util.addDays(CRM.TODAY, d)));
         const items = planned.filter((f) => f.dueDate < t || days.includes(f.dueDate));
-        body.appendChild(ui.callout('Drag a follow-up to another day to reschedule it. Overdue items must be moved to today or later.', 'info'));
+        body.appendChild(calloutH('Drag a follow-up to another day to reschedule it. Overdue items must be moved to today or later.', 'info'));
         body.appendChild(h('div', { class: 'mt' }, ui.kanban({
-          columns: [{ id: 'overdue', label: 'Overdue', color: 'var(--bad)' }].concat(days.map((d, i) => ({ id: d, label: i === 0 ? 'Today' : new Date(d + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short', day: '2-digit', month: 'short' }), color: i === 0 ? 'var(--warn)' : 'var(--chart-5)' }))),
+          columns: [{ id: 'overdue', label: 'Overdue', color: 'var(--bad)' }].concat(days.map((d, i) => ({ id: d, label: i === 0 ? 'Today' : dayLabel(d), color: i === 0 ? 'var(--warn)' : 'var(--chart-5)' }))),
           items, colOf: (f) => (f.dueDate < t ? 'overdue' : f.dueDate),
           card: (f) => [h('div', { class: 't' }, f.accountName), h('div', { class: 'small muted' }, f.type + ' · ' + f.purpose), h('div', { class: 'small' }, execName(f.execId))],
           onMove: canWork() ? (f, to) => { if (to === 'overdue') { ui.toast('Cannot move into Overdue', 'bad'); return; } rescheduleFollowUp(db.get('followups', f.id), to); } : null,
@@ -1490,7 +1770,7 @@
     const ords = db.all('orders').filter((o) => o.approval === 'Approved' && inRange(o.wonDate, from, to) && m(o));
     const calls = db.all('callLogs').filter((c) => inRange(c.date, from, to) && m(c));
     const ups = db.all('upsells').filter((u) => u.status === 'Converted' && inRange(u.convertedAt, from, to) && m(u));
-    return { revenue: sum(ords, 'value'), calls: callCount(calls), coldCalls: callCount(calls.filter((c) => c.type === 'Cold Call')), newCustomers: ords.filter((o) => o.newCustomer).length, upsell: ups.filter((u) => u.type === 'Upsell').length, crossSell: ups.filter((u) => u.type === 'Cross-sell').length, orders: ords.length };
+    return { revenue: sum(ords, 'value'), calls: callCount(calls), coldCalls: callCount(calls.filter((c) => c.type === 'Cold Call')), newCustomers: acquisitions(from, to, m).length, upsell: ups.filter((u) => u.type === 'Upsell').length, crossSell: ups.filter((u) => u.type === 'Cross-sell').length, orders: ords.length };
   }
   function tvaCell(a, t, money) {
     const pct = util.pct(a, t);
@@ -1515,12 +1795,13 @@
       const [from, to] = monthRange(mk);
       const rows = execs().filter((s) => !isExec() || s.id === me()).map((s) => ({ id: s.id, name: s.name, division: s.division, t: targetRec('exec', s.id, mk) || {}, a: achievedFor({ execId: s.id }, from, to) }));
       const drows = DIVS.map((d) => ({ id: d, name: d, t: targetRec('division', d, mk) || {}, a: achievedFor({ division: d }, from, to) }));
-      const totT = sum(drows, (r) => r.t.revenue), totA = sum(drows, (r) => r.a.revenue);
-      host.appendChild(ui.kpis([{ label: 'Revenue achieved · ' + monthLabel(mk), value: fmt.lakh(totA), meta: 'Target ' + fmt.lakh(totT) + ' · ' + util.pct(totA, totT) + '%', tone: totA >= totT ? 'up' : 'down' }].concat(METRICS.slice(1).map(([k, l]) => ({ label: l, value: sum(drows, (r) => r.a[k]) + ' / ' + sum(drows, (r) => r.t[k] || 0) })))));
+      const kr = isExec() ? rows : drows; // executives see only their own figures, never division-wide revenue
+      const totT = sum(kr, (r) => r.t.revenue), totA = sum(kr, (r) => r.a.revenue);
+      host.appendChild(ui.kpis([{ label: (isExec() ? 'My revenue · ' : 'Revenue achieved · ') + monthLabel(mk), value: fmt.lakh(totA), meta: 'Target ' + fmt.lakh(totT) + ' · ' + util.pct(totA, totT) + '%', tone: totA >= totT ? 'up' : 'down' }].concat(METRICS.slice(1).map(([k, l]) => ({ label: l, value: sum(kr, (r) => r.a[k]) + ' / ' + sum(kr, (r) => r.t[k] || 0) })))));
       const cols = (sc) => [{ key: 'name', label: sc === 'exec' ? 'Executive' : 'Division', render: (r) => (sc === 'exec' ? h('div', {}, [h('b', {}, r.name), h('div', {}, ui.divTag(r.division))]) : ui.divTag(r.name)) }].concat(METRICS.map(([k, l, money]) => ({ key: k, label: l, render: (r) => tvaCell(r.a[k], r.t[k] || 0, money), sort: (r) => util.pct(r.a[k], r.t[k]) })));
       host.appendChild(card('Executive-wise target vs achieved', ui.table({ rows: rows, search: false, columns: cols('exec'), actions: isMgr() ? (r) => [ui.btn('Edit', () => editTarget('exec', r.id, mk), 'sm')] : null }), { flush: true }));
       if (!isExec()) section(host, card('Division-wise target vs achieved', ui.table({ rows: drows, search: false, columns: cols('division'), actions: isMgr() ? (r) => [ui.btn('Edit', () => editTarget('division', r.id, mk), 'sm')] : null }), { flush: true }));
-      section(host, h('div', { class: 'grid g2' }, [card('Revenue — executive', ui.hbars(rows.map((r) => ({ label: r.name, value: r.a.revenue, target: r.t.revenue || 0 })), { money: true })), card('Revenue — division', ui.hbars(drows.map((r) => ({ label: r.name, value: r.a.revenue, target: r.t.revenue || 0 })), { money: true }))]));
+      section(host, h('div', { class: 'grid g2' }, [card(isExec() ? 'My revenue vs target' : 'Revenue — executive', ui.hbars(rows.map((r) => ({ label: r.name, value: r.a.revenue, target: r.t.revenue || 0 })), { money: true })), isExec() ? card('New customers acquired', ui.hbars(rows.map((r) => ({ label: r.name, value: r.a.newCustomers, target: r.t.newCustomers || 0 })))) : card('Revenue — division', ui.hbars(drows.map((r) => ({ label: r.name, value: r.a.revenue, target: r.t.revenue || 0 })), { money: true }))]));
     }
     draw();
   }
@@ -1578,19 +1859,33 @@
   }
 
   // ============================================================ dealer sales management
+  // Monthly dealer sales = dealer-sourced orders (enquiries with Lead Source "Dealer" / dealer reference, approved SOs) + dealer-reported secondary sales (manual)
+  const dealerOrders = (d, mk) => db.all('orders').filter((o) => o.dealerId === d.id && o.approval === 'Approved' && (!mk || monthKey(o.wonDate) === mk));
+  const dealerAuto = (d, mk) => sum(dealerOrders(d, mk), 'value');
+  const dealerManual = (d, mk) => Number((d.sales || {})[mk]) || 0;
   function renderDealers(el) {
     const list = scope(db.all('dealers'));
     const months = monthsBack(7), cur = months[6], prev = months[5];
-    ui.page(el, { title: 'Dealer Sales', sub: 'Dealer name, area, dealer sales executive and monthly dealer sales', actions: canWork() ? [ui.btn('+ Dealer', () => ui.formModal('New dealer', [{ key: 'name', label: 'Dealer name', required: true }, { key: 'area', label: 'Dealer area', type: 'select', options: master.areas, required: true }, { key: 'division', label: 'Division', type: 'select', options: DIVS, required: true }, { key: 'execId', label: 'Dealer sales executive', type: 'select', options: execOptions(), required: true, default: isExec() ? me() : '' }, { key: 'contact', label: 'Contact' }, { key: 'phone', label: 'Phone' }, { key: 'creditLimit', label: 'Credit limit (₹)', type: 'number' }], {}, (v) => { if (db.one('dealers', (d) => d.name.toLowerCase() === v.name.toLowerCase())) { ui.toast('Dealer already exists', 'bad'); return false; } db.insert('dealers', Object.assign(v, { sales: {}, since: todayIso(), status: 'Active' }), { prefix: 'DLR' }); ui.toast('Dealer added', 'ok'); CRM.refresh(); })), ui.btn('Record monthly sales', () => dealerSalesModal(list), 'primary')] : [] });
-    const tot = (k) => sum(list, (d) => (d.sales || {})[k] || 0);
-    el.appendChild(ui.kpis([{ label: 'Active dealers', value: list.length }, { label: 'Dealer sales · ' + monthLabel(cur), value: fmt.lakh(tot(cur)), meta: (tot(prev) ? (tot(cur) >= tot(prev) ? '▲ ' : '▼ ') + util.pct(Math.abs(tot(cur) - tot(prev)), tot(prev)) + '% vs ' + monthLabel(prev) : ''), tone: tot(cur) >= tot(prev) ? 'up' : 'down' }, { label: 'Last 7 months', value: fmt.lakh(sum(months, tot)) }]));
+    ui.page(el, { title: 'Dealer Sales', sub: 'Dealer name, area, dealer sales executive and monthly dealer sales — derived from dealer-sourced orders, plus dealer-reported sales', actions: canWork() ? [ui.btn('+ Dealer', () => ui.formModal('New dealer', [{ key: 'name', label: 'Dealer name', required: true }, { key: 'area', label: 'Dealer area', type: 'select', options: master.areas, required: true }, { key: 'division', label: 'Division', type: 'select', options: DIVS, required: true }, { key: 'execId', label: 'Dealer sales executive', type: 'select', options: execOptions(), required: true, default: isExec() ? me() : '' }, { key: 'contact', label: 'Contact' }, { key: 'phone', label: 'Phone' }, { key: 'creditLimit', label: 'Credit limit (₹)', type: 'number' }], {}, (v) => { if (db.one('dealers', (d) => d.name.toLowerCase() === v.name.toLowerCase())) { ui.toast('Dealer already exists', 'bad'); return false; } db.insert('dealers', Object.assign(v, { sales: {}, since: todayIso(), status: 'Active' }), { prefix: 'DLR' }); ui.toast('Dealer added', 'ok'); CRM.refresh(); })), ui.btn('Record dealer-reported sales', () => dealerSalesModal(list), 'primary')] : [] });
+    const auto = (k) => sum(list, (d) => dealerAuto(d, k)), man = (k) => sum(list, (d) => dealerManual(d, k)), tot = (k) => auto(k) + man(k);
+    el.appendChild(ui.kpis([{ label: 'Active dealers', value: list.length }, { label: 'Dealer sales · ' + monthLabel(cur), value: fmt.lakh(tot(cur)), meta: (tot(prev) ? (tot(cur) >= tot(prev) ? '▲ ' : '▼ ') + util.pct(Math.abs(tot(cur) - tot(prev)), tot(prev)) + '% vs ' + monthLabel(prev) : ''), tone: tot(cur) >= tot(prev) ? 'up' : 'down' }, { label: 'From dealer-sourced orders · ' + monthLabel(cur), value: fmt.lakh(auto(cur)), meta: list.reduce((n, d) => n + dealerOrders(d, cur).length, 0) + ' orders (auto)', color: 'var(--ok)' }, { label: 'Dealer-reported · ' + monthLabel(cur), value: fmt.lakh(man(cur)), color: 'var(--chart-3)' }, { label: 'Last 7 months', value: fmt.lakh(sum(months, tot)) }]));
     el.appendChild(h('div', { class: 'grid g3' }, [
-      h('div', { class: 'span2' }, card('Dealers', ui.table({ rows: () => list.map((d) => Object.assign({}, d, { execName: execName(d.execId), cur: (d.sales || {})[cur] || 0, prev: (d.sales || {})[prev] || 0, six: sum(months, (m) => (d.sales || {})[m] || 0) })), filters: [{ key: 'division', label: 'divisions', options: DIVS }], columns: [{ key: 'name', label: 'Dealer name', render: (d) => h('div', {}, [h('b', {}, d.name), h('div', { class: 'small muted' }, d.id + ' · ' + (d.contact || '') + ' · ' + (d.phone || ''))]) }, { key: 'area', label: 'Dealer area' }, { key: 'division', label: 'Division', render: (d) => ui.divTag(d.division) }, { key: 'execName', label: 'Dealer sales executive' }, { key: 'cur', label: monthLabel(cur), cls: 'right', render: (d) => fmt.money(d.cur) }, { key: 'prev', label: monthLabel(prev), cls: 'right', render: (d) => fmt.money(d.prev) }, { key: 'trend', label: 'Trend', render: (d) => ui.badge(d.cur >= d.prev ? '▲' : '▼', d.cur >= d.prev ? 'ok' : 'bad'), sort: (d) => d.cur - d.prev }, { key: 'six', label: '7-month total', cls: 'right', render: (d) => fmt.lakh(d.six) }] }), { flush: true })),
-      card('Monthly dealer sales', ui.barChart(months.map((m) => ({ label: monthLabel(m), values: [tot(m)] })), [{ name: 'Dealer sales', color: 'var(--chart-3)' }], { money: true, height: 240 })),
+      h('div', { class: 'span2' }, card('Dealers', ui.table({ rows: () => list.map((d) => Object.assign({}, d, { execName: execName(d.execId), auto: dealerAuto(d, cur), man: dealerManual(d, cur), cur: dealerAuto(d, cur) + dealerManual(d, cur), prev: dealerAuto(d, prev) + dealerManual(d, prev), six: sum(months, (m) => dealerAuto(d, m) + dealerManual(d, m)), n: dealerOrders(d).length })), filters: [{ key: 'division', label: 'divisions', options: DIVS }], columns: [{ key: 'name', label: 'Dealer name', render: (d) => h('div', {}, [h('b', {}, d.name), h('div', { class: 'small muted' }, d.id + ' · ' + (d.contact || '') + ' · ' + (d.phone || ''))]) }, { key: 'area', label: 'Dealer area' }, { key: 'division', label: 'Division', render: (d) => ui.divTag(d.division) }, { key: 'execName', label: 'Dealer sales executive' }, { key: 'auto', label: monthLabel(cur) + ' · orders', cls: 'right', render: (d) => fmt.money(d.auto) }, { key: 'man', label: monthLabel(cur) + ' · reported', cls: 'right', render: (d) => fmt.money(d.man) }, { key: 'prev', label: monthLabel(prev), cls: 'right', render: (d) => fmt.money(d.prev) }, { key: 'trend', label: 'Trend', render: (d) => ui.badge(d.cur >= d.prev ? '▲' : '▼', d.cur >= d.prev ? 'ok' : 'bad'), sort: (d) => d.cur - d.prev }, { key: 'n', label: 'Orders (all)', cls: 'right' }, { key: 'six', label: '7-month total', cls: 'right', render: (d) => fmt.lakh(d.six) }], onRow: (d) => dealerDrawer(db.get('dealers', d.id)) }), { flush: true })),
+      card('Monthly dealer sales', ui.barChart(months.map((m) => ({ label: monthLabel(m), values: [auto(m), man(m)] })), [{ name: 'Dealer-sourced orders', color: 'var(--chart-1)' }, { name: 'Dealer-reported', color: 'var(--chart-3)' }], { money: true, height: 240 })),
     ]));
   }
+  function dealerDrawer(d) {
+    if (!d) return;
+    const ords = dealerOrders(d).sort((a, b) => (a.wonDate < b.wonDate ? 1 : -1));
+    ui.drawer({ title: d.name, sub: d.area + ' · ' + d.division + ' · ' + execName(d.execId), body: h('div', { class: 'stack' }, [
+      ui.dl([['Dealer ID', d.id], ['Contact', [d.contact, d.phone].filter(Boolean).join(' · ')], ['Credit limit', fmt.money(d.creditLimit)], ['Since', fmt.date(d.since)], ['Dealer-sourced orders', ords.length + ' · ' + fmt.lakh(sum(ords, 'value'))]]),
+      h('h3', {}, 'Dealer-sourced orders'),
+      ui.table({ rows: ords, search: false, pageSize: 8, onRow: (o) => orderDrawer(db.get('orders', o.id)), empty: 'No orders from leads of this dealer yet', columns: [{ key: 'wonDate', label: 'Won', render: (o) => fmt.date(o.wonDate) }, { key: 'soNumber', label: 'SO', render: (o) => mono(o.soNumber) }, { key: 'accountName', label: 'Customer' }, { key: 'value', label: 'Value', cls: 'right', render: (o) => fmt.money(o.value) }, { key: 'execId', label: 'Executive', render: (o) => execName(o.execId) }] }),
+    ]) });
+  }
   function dealerSalesModal(list) {
-    ui.formModal('Record monthly dealer sales', [{ key: 'dealerId', label: 'Dealer', type: 'select', required: true, options: list.map((d) => ({ value: d.id, label: d.name })) }, { key: 'month', label: 'Month', type: 'month', required: true, default: monthKey(CRM.TODAY) }, { key: 'value', label: 'Sales value (₹)', type: 'number', required: true }], {}, (v) => {
+    ui.formModal('Record dealer-reported monthly sales', [{ key: 'dealerId', label: 'Dealer', type: 'select', required: true, options: list.map((d) => ({ value: d.id, label: d.name })) }, { key: 'month', label: 'Month', type: 'month', required: true, default: monthKey(CRM.TODAY) }, { key: 'value', label: 'Dealer-reported sales value (₹) — secondary sales not booked through our orders', type: 'number', required: true, min: 0 }], {}, (v) => {
+      if (!(v.value >= 0)) { ui.toast('Enter a value of zero or more', 'bad'); return false; }
       const d = db.get('dealers', v.dealerId); db.update('dealers', d.id, { sales: Object.assign({}, d.sales, { [v.month]: v.value }) }, { note: 'Monthly sales ' + v.month + ' = ' + fmt.money(v.value) });
       ui.toast('Dealer sales recorded', 'ok'); CRM.refresh();
     });
@@ -1626,10 +1921,10 @@
     const grid = h('div', { class: 'grid g2' });
     el.appendChild(grid);
     const screen = h('div', { class: 'phone-screen' });
-    const left = isExec() ? h('div', { class: 'phone' }, screen) : card('Phone preview', ui.callout('The phone app is used by Sales Executives. Switch role to <b>Sales Executive</b> to use it. Field activity of all executives is listed alongside.', 'info'));
+    const left = isExec() ? h('div', { class: 'phone' }, screen) : card('Phone preview', calloutH('The phone app is used by Sales Executives. Switch role to <b>Sales Executive</b> to use it. Field activity of all executives is listed alongside.', 'info'));
     const chks = scope(db.all('checkins')).slice().sort((a, b) => (a.checkInAt < b.checkInAt ? 1 : -1));
     const right = h('div', { class: 'stack' }, [
-      card('Check-in / check-out register', ui.table({ rows: chks.map((c) => Object.assign({}, c, { execName: execName(c.execId) })), search: !isExec(), pageSize: 8, columns: [{ key: 'date', label: 'Date', render: (c) => fmt.date(c.date) }, { key: 'execName', label: 'Executive' }, { key: 'checkInAt', label: 'In', render: (c) => h('div', {}, [new Date(c.checkInAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }), h('div', { class: 'small' }, mapLink(c.checkInLoc))]) }, { key: 'checkOutAt', label: 'Out', render: (c) => (c.checkOutAt ? h('div', {}, [new Date(c.checkOutAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }), h('div', { class: 'small' }, mapLink(c.checkOutLoc))]) : ui.badge('On field', 'warn')) }, { key: 'visits', label: 'Visits', render: (c) => (c.visits || []).length }], onRow: (c) => ui.drawer({ title: 'Field day · ' + execName(c.execId), sub: fmt.date(c.date), body: h('div', { class: 'stack' }, [routeMap(c), ui.timeline([{ when: fmt.dateTime(c.checkInAt), title: 'Checked in', body: mapLink(c.checkInLoc).textContent }].concat((c.visits || []).map((v) => ({ when: fmt.dateTime(v.at), title: v.note + ' · ' + (v.accountName || ''), body: v.loc ? v.loc.lat + ', ' + v.loc.lng : '' })), c.checkOutAt ? [{ when: fmt.dateTime(c.checkOutAt), title: 'Checked out' }] : []))]) }) }), { flush: true }),
+      card('Check-in / check-out register', ui.table({ rows: chks.map((c) => Object.assign({}, c, { execName: execName(c.execId) })), search: !isExec(), pageSize: 8, columns: [{ key: 'date', label: 'Date', render: (c) => fmt.date(c.date) }, { key: 'execName', label: 'Executive' }, { key: 'checkInAt', label: 'In', render: (c) => h('div', {}, [timeText(c.checkInAt), h('div', { class: 'small' }, mapLink(c.checkInLoc))]) }, { key: 'checkOutAt', label: 'Out', render: (c) => (c.checkOutAt ? h('div', {}, [timeText(c.checkOutAt), h('div', { class: 'small' }, mapLink(c.checkOutLoc))]) : ui.badge('On field', 'warn')) }, { key: 'visits', label: 'Visits', render: (c) => (c.visits || []).length }], onRow: (c) => ui.drawer({ title: 'Field day · ' + execName(c.execId), sub: fmt.date(c.date), body: h('div', { class: 'stack' }, [routeMap(c), ui.timeline([{ when: fmt.dateTime(c.checkInAt), title: 'Checked in', body: mapLink(c.checkInLoc).textContent }].concat((c.visits || []).map((v) => ({ when: fmt.dateTime(v.at), title: v.note + ' · ' + (v.accountName || ''), body: v.loc ? v.loc.lat + ', ' + v.loc.lng : '' })), c.checkOutAt ? [{ when: fmt.dateTime(c.checkOutAt), title: 'Checked out' }] : []))]) }) }), { flush: true }),
       chks[0] ? card('Location mapping · ' + execName(chks[0].execId) + ' · ' + fmt.date(chks[0].date), routeMap(chks[0])) : null,
     ]);
     grid.appendChild(left); grid.appendChild(right);
@@ -1647,11 +1942,11 @@
         screen.appendChild(h('div', { style: 'background:linear-gradient(105deg,var(--power-black) 72%,var(--maruthi-red) 72%);color:#fff;padding:18px 16px 16px' }, [
           h('div', { class: 'small', style: 'opacity:.8' }, fmt.date(new Date()) + ' · Maruthi Sales'),
           h('h2', { style: 'margin:4px 0 2px' }, 'Hi, ' + CRM.user().name.split(' ')[0]),
-          h('div', { class: 'small', style: 'opacity:.9' }, chk ? (chk.checkOutAt ? 'Checked out at ' + new Date(chk.checkOutAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : 'On field since ' + new Date(chk.checkInAt).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })) : 'Not checked in'),
+          h('div', { class: 'small', style: 'opacity:.9' }, chk ? (chk.checkOutAt ? 'Checked out at ' + timeText(chk.checkOutAt) : 'On field since ' + timeText(chk.checkInAt)) : 'Not checked in'),
         ]));
         const body = h('div', { style: 'padding:14px', class: 'stack' });
         body.appendChild(!chk ? pbtn('📍 Check in', () => { ui.toast('Fetching location…'); getLocation().then((loc) => { db.insert('checkins', { execId: me(), date: todayIso(), checkInAt: nowIso(), checkInLoc: loc, checkOutAt: '', checkOutLoc: null, visits: [] }, { prefix: 'CHK', note: 'Checked in' }); ui.toast('Checked in' + (loc.simulated ? ' (simulated location)' : ''), 'ok'); CRM.refresh(); }); }, 'primary')
-          : !chk.checkOutAt ? pbtn('🏁 Check out', () => { getLocation().then((loc) => { db.update('checkins', chk.id, { checkOutAt: nowIso(), checkOutLoc: loc }, { note: 'Checked out' }); ui.toast('Checked out', 'ok'); CRM.refresh(); }); }, 'danger') : ui.callout('Day closed · ' + (chk.visits || []).length + ' visits logged', 'ok'));
+          : !chk.checkOutAt ? pbtn('🏁 Check out', () => { getLocation().then((loc) => { db.update('checkins', chk.id, { checkOutAt: nowIso(), checkOutLoc: loc }, { note: 'Checked out' }); ui.toast('Checked out', 'ok'); CRM.refresh(); }); }, 'danger') : calloutH('Day closed · ' + (chk.visits || []).length + ' visits logged', 'ok'));
         body.appendChild(h('div', { class: 'grid', style: 'grid-template-columns:1fr 1fr;gap:10px' }, [
           pbtn('➕ New enquiry', () => go('enquiry')), pbtn('📅 Follow-ups (' + tasks.filter((t) => t.fu).length + ')', () => go('followups')),
           pbtn('🏠 Site visit', () => go('visit')), pbtn('📄 Upload quote', () => go('quote')),
@@ -1703,7 +1998,7 @@
       } else if (view === 'quote') {
         screen.appendChild(backBar('Upload quotation'));
         const qs = allQuotes().filter((q) => q.status !== 'Rejected').sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1)).slice(0, 12);
-        screen.appendChild(h('div', { style: 'padding:12px', class: 'stack' }, [pbtn('+ New quotation', () => quoteModal(), 'primary')].concat(qs.map((q) => { const inp = h('input', { type: 'file', style: 'max-width:100%' }); inp.addEventListener('change', () => { if (inp.files[0]) { db.update('quotations', q.id, { fileName: inp.files[0].name }, { note: 'Uploaded from mobile: ' + inp.files[0].name }); ui.toast('Uploaded ' + inp.files[0].name, 'ok'); draw(); } }); return h('div', { class: 'card card-body' }, [h('div', { class: 'row', style: 'justify-content:space-between' }, [h('b', {}, q.id), ui.badge(q.approval === 'Approved' ? q.status : q.approval)]), h('div', { class: 'small muted' }, q.accountName + ' · ' + fmt.money(q.quoteValue)), h('div', { class: 'small' }, '📎 ' + (q.fileName || 'No file')), inp]); }))));
+        screen.appendChild(h('div', { style: 'padding:12px', class: 'stack' }, [pbtn('+ New quotation', () => quoteModal(), 'primary')].concat(qs.map((q) => { const inp = h('input', { type: 'file', accept: QUOTE_ACCEPT, style: 'max-width:100%' }); inp.addEventListener('change', () => { if (inp.files[0]) { const nm = inp.files[0].name; storeQuoteFile(q.id, inp.files[0], 'Uploaded from mobile: ' + nm, () => { ui.toast('Uploaded ' + nm, 'ok'); draw(); }); } }); return h('div', { class: 'card card-body' }, [h('div', { class: 'row', style: 'justify-content:space-between' }, [h('b', {}, q.id), ui.badge(q.approval === 'Approved' ? q.status : q.approval)]), h('div', { class: 'small muted' }, q.accountName + ' · ' + fmt.money(q.quoteValue)), h('div', { class: 'small' }, q.fileName ? quoteFileLink(q) : '📎 No file'), inp]); }))));
       } else if (view === 'order') {
         screen.appendChild(backBar('Order status'));
         screen.appendChild(h('div', { style: 'padding:12px', class: 'stack' }, myOpen().slice(0, 15).map((e) => { const sel = h('select', { style: 'width:100%' }, [h('option', { value: '' }, 'Update stage…')].concat(STAGES.filter((s) => s !== e.stage).map((s) => h('option', { value: s }, s)))); sel.addEventListener('change', () => { if (sel.value) moveStage(e, sel.value, draw); sel.value = ''; }); return h('div', { class: 'card card-body' }, [h('div', { class: 'row', style: 'justify-content:space-between' }, [h('b', {}, e.accountName), stageBadge(e.stage)]), h('div', { class: 'small muted', style: 'margin-bottom:6px' }, e.id + ' · ' + e.product), sel]); }).concat(allOrders().filter((o) => !o.migrated).slice(-5).reverse().map((o) => h('div', { class: 'card card-body' }, [h('b', {}, o.soNumber || o.id), h('div', { class: 'small muted' }, o.accountName), ui.badge(orderStatus(o))])))));
@@ -1721,6 +2016,8 @@
   const pickField = (rec, ...names) => { const keys = Object.keys(rec); for (const n of names) { const k = keys.find((x) => norm(x) === norm(n)); if (k && rec[k] !== '') return rec[k]; } return ''; };
   const parseDate = (s) => { s = String(s || '').trim(); if (!s) return null; let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s); if (m) return new Date(+m[1], +m[2] - 1, +m[3], 10); m = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})/.exec(s); if (m) return new Date(+(m[3].length === 2 ? '20' + m[3] : m[3]), +m[2] - 1, +m[1], 10); const d = new Date(s); return isNaN(d) ? null : d; };
   const matchOpt = (val, opts) => opts.find((o) => norm(o) === norm(val)) || '';
+  const money = (v) => Number(String(v || '').replace(/[^\d.]/g, '')) || 0;
+  const yes = (v) => /^(y|yes|true|1|done)$/i.test(String(v || '').trim());
   const IMPORTERS = {
     customers: {
       label: 'Customer master', header: ['Account Name', 'Customer Type', 'Contact Name', 'Contact Number', 'Email', 'Area', 'Segment', 'GSTIN'],
@@ -1761,10 +2058,123 @@
       },
       cols: ['accountName', 'division', 'product', 'quantity', 'expectedValue', 'stage'],
     },
+    orders: {
+      label: 'Sales orders', roles: ['sales_manager', 'admin'],
+      header: ['SO Number', 'PO Number', 'Order Date', 'SO Issued Date', 'Account Name', 'Contact Number', 'Division', 'Product', 'Quantity', 'Order Value', 'Payment Terms', 'Executive Name', 'Lead Source', 'Dealer Name', 'Installation Completion Date', 'New Customer'],
+      sample: [['SO/25-26/H812', 'PO/KMC/2025/77', '14/09/2025', '15/09/2025', 'Kovai Medical Center', '9843012345', 'Power', 'Maruthi Online UPS 10KVA', '2', '270000', 'Credit 30 days', 'Deepak S', 'Walk-in', '', '24/09/2025', 'No'], ['SO/25-26/H813', 'PO/SVP/118', '02/10/2025', '02/10/2025', 'Sri Vinayaga Traders', '9790055511', 'Power', 'Exide 150Ah Tubular', '6', '84000', 'Against delivery', '', 'Dealer', 'Sri Vinayaga Power Systems', '06/10/2025', 'Yes']],
+      check(r, seen) {
+        const division = matchOpt(pickField(r, 'Division'), DIVS);
+        const pname = pickField(r, 'Product');
+        const p = division && (master.products(division).find((x) => norm(x.name) === norm(pname)) || master.products(division).find((x) => pname && norm(x.name).includes(norm(pname))));
+        const ex = execs().find((s2) => norm(s2.name) === norm(pickField(r, 'Executive Name', 'Executive')));
+        const dl = db.all('dealers').find((x) => norm(x.name) === norm(pickField(r, 'Dealer Name', 'Dealer')));
+        const won = parseDate(pickField(r, 'Order Date', 'Order Won Date', 'Date'));
+        const d = { soNumber: pickField(r, 'SO Number', 'Sales Order Number'), poNumber: pickField(r, 'PO Number'), wonDate: won, soIssuedDate: parseDate(pickField(r, 'SO Issued Date')) || won, accountName: pickField(r, 'Account Name', 'Customer Name'), phone: pickField(r, 'Contact Number', 'Phone'), division, productId: p ? p.id : '', product: p ? p.name : pname, quantity: Number(pickField(r, 'Quantity', 'Qty')) || 1, value: money(pickField(r, 'Order Value', 'Value')), paymentTerms: matchOpt(pickField(r, 'Payment Terms'), Object.keys(PAY_TERMS)) || 'Credit 30 days', execId: ex ? ex.id : '', leadSource: matchOpt(pickField(r, 'Lead Source'), LEAD_SOURCES) || '', dealerId: dl ? dl.id : '', installationCompletionDate: parseDate(pickField(r, 'Installation Completion Date', 'Installed On')), newCustomer: yes(pickField(r, 'New Customer')) };
+        if (!d.soNumber || !d.accountName) return { ok: false, msg: 'SO number and account name are mandatory', d };
+        if (!division) return { ok: false, msg: 'Division must be Power / Electronic Security / Solar', d };
+        if (!won) return { ok: false, msg: 'Order date missing or not a date', d };
+        if (!(d.value > 0)) return { ok: false, msg: 'Order value must be greater than zero', d };
+        if (db.one('orders', (o) => norm(o.soNumber) === norm(d.soNumber)) || seen.has('so:' + norm(d.soNumber))) return { ok: false, msg: 'SO ' + d.soNumber + ' already exists — skipped', d, dup: true };
+        seen.add('so:' + norm(d.soNumber));
+        const cust = findDuplicateCustomer({ accountName: d.accountName, contactNumber: d.phone });
+        if (cust) { d.customerId = cust.id; d.accountName = cust.name; }
+        return { ok: true, msg: (cust ? 'Linked to ' + cust.id : 'New customer will be created') + (p ? '' : ' · product not in master (kept as text)') + (pickField(r, 'Dealer Name') && !dl ? ' · dealer not found' : ''), d };
+      },
+      collection: 'orders', prefix: 'ORD',
+      toRecord: (d) => Object.assign({ enquiryId: '', quotationId: '', customerId: d.customerId || '', accountName: d.accountName, division: d.division, execId: d.execId, productId: d.productId, product: d.product, quantity: d.quantity, value: d.value, wonDate: d.wonDate.toISOString(), poNumber: d.poNumber, materialAvailability: 'Available in stock', deliveryCommitDate: '', paymentTerms: d.paymentTerms, creditDays: PAY_TERMS[d.paymentTerms] || 0, approval: 'Approved', approvedBy: 'Data migration', approvedAt: d.soIssuedDate.toISOString(), soNumber: d.soNumber, soIssuedDate: d.soIssuedDate.toISOString(), newCustomer: !!d.newCustomer, salesChannel: 'Migrated', leadSource: d.leadSource, dealerId: d.dealerId, installationStatus: d.installationCompletionDate ? 'Completed' : 'Pending', installationCompletionDate: d.installationCompletionDate ? util.iso(d.installationCompletionDate) : '', deliveredDate: d.installationCompletionDate ? util.iso(d.installationCompletionDate) : '', migrated: true, createdAt: d.wonDate.toISOString(), _phone: d.phone }, divisionExtras(d.division, d.productId, d.quantity)),
+      before(rec) { if (!rec.customerId) rec.customerId = importCustomer(rec.accountName, rec._phone, rec.newCustomer ? 'New Customer' : 'Existing Customer', rec.wonDate); delete rec._phone; },
+      after(rec) { promoteCustomer(rec.customerId); },
+      cols: ['soNumber', 'accountName', 'division', 'product', 'quantity', 'value'],
+    },
+    invoices: {
+      label: 'Invoices', roles: ['accounts', 'sales_manager', 'admin'],
+      header: ['Invoice Number', 'Invoice Date', 'SO Number', 'Account Name', 'Division', 'Invoice Value', 'Payment Terms', 'Payment Due Date', 'Hard Copy Submitted', 'Invoice Mailed', 'Confirmed With'],
+      sample: [['MPCS/25-26/INV-0815', '16/09/2025', 'SO/25-26/H812', 'Kovai Medical Center', 'Power', '318600', 'Credit 30 days', '', 'Yes', 'Yes', 'Mohan S'], ['MPCS/25-26/INV-0841', '03/10/2025', 'SO/25-26/H813', 'Sri Vinayaga Traders', 'Power', '99120', 'Against delivery', '03/10/2025', 'Yes', 'No', '']],
+      check(r, seen) {
+        const no = pickField(r, 'Invoice Number', 'Invoice No');
+        const so = pickField(r, 'SO Number');
+        const o = so ? db.one('orders', (x) => norm(x.soNumber) === norm(so)) : null;
+        const date = parseDate(pickField(r, 'Invoice Date', 'Date'));
+        const terms = matchOpt(pickField(r, 'Payment Terms'), Object.keys(PAY_TERMS)) || (o && o.paymentTerms) || 'Credit 30 days';
+        const cust = o ? master.customer(o.customerId) : findDuplicateCustomer({ accountName: pickField(r, 'Account Name', 'Customer Name') });
+        const d = { invoiceNo: no, invoiceDate: date, soNumber: o ? o.soNumber : so, orderId: o ? o.id : '', customerId: cust ? cust.id : '', accountName: cust ? cust.name : pickField(r, 'Account Name'), division: (o && o.division) || matchOpt(pickField(r, 'Division'), DIVS), execId: o ? o.execId : '', value: money(pickField(r, 'Invoice Value', 'Value')), paymentTerms: terms, dueDate: parseDate(pickField(r, 'Payment Due Date', 'Due Date')), hardCopySubmitted: yes(pickField(r, 'Hard Copy Submitted')), invoiceMailed: yes(pickField(r, 'Invoice Mailed')), confirmedWith: pickField(r, 'Confirmed With') };
+        if (!no || !date) return { ok: false, msg: 'Invoice number and invoice date are mandatory', d };
+        if (!(d.value > 0)) return { ok: false, msg: 'Invoice value must be greater than zero', d };
+        if (!d.customerId) return { ok: false, msg: 'Customer not found — import the customer master / sales orders first', d };
+        if (!d.division) return { ok: false, msg: 'Division must be Power / Electronic Security / Solar', d };
+        if (db.one('invoices', (i) => norm(i.invoiceNo) === norm(no)) || seen.has(norm(no))) return { ok: false, msg: 'Invoice ' + no + ' already exists — skipped', d, dup: true };
+        seen.add(norm(no));
+        if (!d.dueDate) d.dueDate = util.addDays(date, PAY_TERMS[terms] || 0);
+        return { ok: true, msg: (o ? 'Linked to ' + (o.soNumber || o.id) : 'No sales order link') + ' · due ' + fmt.date(d.dueDate), d };
+      },
+      collection: 'invoices', prefix: 'INV',
+      toRecord: (d) => Object.assign({}, d, { invoiceDate: util.iso(d.invoiceDate), dueDate: util.iso(d.dueDate), gstPct: gstPct(d.division), source: 'Sales', migrated: true, createdAt: d.invoiceDate.toISOString() }),
+      cols: ['invoiceNo', 'accountName', 'soNumber', 'division', 'value', 'paymentTerms'],
+    },
+    payments: {
+      label: 'Payments / receipts', roles: ['accounts', 'sales_manager', 'admin'],
+      header: ['Invoice Number', 'Received Date', 'Received Value', 'Payment Mode', 'Reference', 'Confirmed With'],
+      sample: [['MPCS/25-26/INV-0815', '12/10/2025', '318600', 'NEFT / RTGS', 'UTR558812', 'Mohan S'], ['MPCS/25-26/INV-0841', '05/10/2025', '50000', 'Cheque', 'CHQ 004512', '']],
+      check(r, seen) {
+        const no = pickField(r, 'Invoice Number', 'Invoice No');
+        const inv = db.one('invoices', (i) => norm(i.invoiceNo) === norm(no));
+        const d = { invoiceNo: no, invoiceId: inv ? inv.id : '', accountName: inv ? inv.accountName : '', receivedDate: parseDate(pickField(r, 'Received Date', 'Payment Received Date', 'Date')), value: money(pickField(r, 'Received Value', 'Value', 'Amount')), mode: matchOpt(pickField(r, 'Payment Mode', 'Mode'), PAY_MODES) || 'NEFT / RTGS', reference: pickField(r, 'Reference', 'UTR'), confirmedWith: pickField(r, 'Confirmed With') };
+        if (!inv) return { ok: false, msg: 'Invoice ' + (no || '?') + ' not found — import invoices first', d };
+        if (!d.receivedDate) return { ok: false, msg: 'Received date missing or not a date', d };
+        if (!(d.value > 0)) return { ok: false, msg: 'Received value must be greater than zero', d };
+        const used = seen.used || (seen.used = {});
+        const left = outstandingOf(inv) - (used[inv.id] || 0);
+        if (d.value > left) return { ok: false, msg: 'Exceeds outstanding of ' + fmt.money(left), d };
+        if (d.reference && db.one('payments', (p) => p.invoiceId === inv.id && norm(p.reference) === norm(d.reference))) return { ok: false, msg: 'Receipt ' + d.reference + ' already recorded — skipped', d, dup: true };
+        used[inv.id] = (used[inv.id] || 0) + d.value;
+        return { ok: true, msg: 'Ready · ' + (util.iso(d.receivedDate) <= util.iso(inv.dueDate) ? 'on time' : 'late') + ' vs due ' + fmt.date(inv.dueDate), d };
+      },
+      collection: 'payments', prefix: 'PAY',
+      toRecord(d) {
+        const i = db.get('invoices', d.invoiceId);
+        return { invoiceId: i.id, orderId: i.orderId, customerId: i.customerId, accountName: i.accountName, division: i.division, execId: i.execId, receivedDate: util.iso(d.receivedDate), value: d.value, mode: d.mode, reference: d.reference, confirmedWith: d.confirmedWith, recordedBy: 'Data migration', verified: true, verifiedBy: CRM.user().name, onTime: !i.dueDate || util.iso(d.receivedDate) <= util.iso(i.dueDate), migrated: true, createdAt: d.receivedDate.toISOString() };
+      },
+      cols: ['invoiceNo', 'accountName', 'receivedDate', 'value', 'mode'],
+    },
   };
+  IMPORTERS.customers.roles = ['sales_manager', 'admin'];
+  IMPORTERS.leads.roles = ['sales_manager', 'admin'];
+  const MONEY_COLS = ['expectedValue', 'value'];
+  function commitImport(imp, d) {
+    if (imp.commit) { imp.commit(d); return; }
+    const rec = imp.toRecord(d);
+    if (imp.before) imp.before(rec);
+    const n = db.insert(imp.collection, rec, { prefix: imp.prefix, note: imp.label + ' imported (data migration)' });
+    if (imp.after) imp.after(n);
+  }
+  // Also offer the sales-history importers on the core Data Import page (Core API v2)
+  if (CRM.registerImporter) ['orders', 'invoices', 'payments'].forEach((k) => {
+    const imp = IMPORTERS[k];
+    CRM.registerImporter({
+      id: 'sales-' + k, title: 'Sales · ' + imp.label, collection: imp.collection, prefix: imp.prefix, roles: imp.roles,
+      description: 'Sales data migration — same validation as Sales › Data Migration (links customers, orders and invoices; duplicates skipped).',
+      columns: imp.header.map((hd) => ({ key: hd, label: hd })), sample: imp.sample,
+      map(row, ctx) {
+        const seen = ctx.salesSeen || (ctx.salesSeen = new Set());
+        const r = imp.check(row, seen);
+        if (!r.ok) return r.dup ? { skip: r.msg } : { error: r.msg };
+        return imp.toRecord(r.d);
+      },
+      beforeInsert: imp.before ? (rec) => imp.before(rec) : undefined,
+      onInserted: imp.after ? (rec) => imp.after(rec) : undefined,
+    });
+  });
+  function importCustomer(name, phone, type, since) {
+    const c = db.insert('customers', { id: nextCustomerId(), name, type: type || 'Existing Customer', contact: '', phone: phone || '', email: '', area: master.areas[0], segment: 'Commercial', since: util.iso(since || CRM.TODAY), source: 'Data migration (sales history)' }, { prefix: 'CUS', note: 'Customer created from imported sales history' });
+    db.insert('sites', { customerId: c.id, name: 'Main Site', address: 'Coimbatore', contact: '', phone: phone || '', access: 'Reception' }, { silent: true });
+    return c.id;
+  }
   function renderImport(el) {
     ui.page(el, { title: 'Data Migration', sub: 'Import the existing CRM / Excel data — save the sheet as CSV, preview & validate, then import. Duplicates are checked against the customer master.' });
-    el.appendChild(ui.tabs(Object.keys(IMPORTERS).map((k) => ({ id: k, label: IMPORTERS[k].label })), (id, body) => {
+    const keys = Object.keys(IMPORTERS).filter((k) => CRM.is(...IMPORTERS[k].roles));
+    if (!keys.length) { el.appendChild(ui.empty('No importers available for your role', '🔒')); return; }
+    el.appendChild(calloutH('Suggested order: <b>customer master → lead history → sales orders → invoices → payments</b>. Imported orders are marked as migrated history (no hand-over to Projects / Service); imported receipts are recorded as verified.', 'info'));
+    el.appendChild(ui.tabs(keys.map((k) => ({ id: k, label: IMPORTERS[k].label })), (id, body) => {
       const imp = IMPORTERS[id];
       const ta = h('textarea', { style: 'width:100%;min-height:140px;font-family:var(--mono);font-size:12px;padding:8px;border:1px solid var(--border-strong);border-radius:7px;background:var(--surface)', placeholder: 'Paste CSV here (first row = headers) or choose a file…' });
       const file = h('input', { type: 'file', accept: '.csv,.txt' });
@@ -1773,15 +2183,15 @@
       function preview() {
         out.innerHTML = '';
         const { header, records } = parseCsv(ta.value);
-        if (!records.length) { out.appendChild(ui.callout('No data rows found. The first row must contain the headers: ' + imp.header.join(', '), 'warn')); return; }
+        if (!records.length) { out.appendChild(calloutH('No data rows found. The first row must contain the headers: ' + imp.header.join(', '), 'warn')); return; }
         const seen = new Set();
         const res = records.map((r, i) => Object.assign({ row: i + 2 }, imp.check(r, seen)));
         const ok = res.filter((r) => r.ok);
-        out.appendChild(ui.callout('<b>' + records.length + '</b> rows read · columns: ' + util.esc(header.join(', ')) + ' · <b>' + ok.length + '</b> ready · <b>' + (res.length - ok.length) + '</b> will be skipped', ok.length ? 'ok' : 'warn'));
-        out.appendChild(h('div', { class: 'mt' }, card('Preview', ui.table({ rows: res.map((r) => Object.assign({ status: r.ok ? 'Ready' : r.dup ? 'Duplicate' : 'Error', msg: r.msg }, r.d, { row: r.row })), search: false, pageSize: 10, columns: [{ key: 'row', label: 'Row' }].concat(imp.cols.map((k) => ({ key: k, label: k, render: (r) => (k === 'expectedValue' ? fmt.money(r[k]) : r[k]) })), [{ key: 'status', label: 'Status', render: (r) => ui.badge(r.status, r.status === 'Ready' ? 'ok' : r.status === 'Duplicate' ? 'warn' : 'bad') }, { key: 'msg', label: 'Validation' }]) }), { flush: true, actions: ok.length ? [ui.btn('Import ' + ok.length + ' rows', () => { ok.forEach((r) => imp.commit(r.d)); ui.toast(ok.length + ' ' + imp.label.toLowerCase() + ' records imported', 'ok'); ta.value = ''; out.innerHTML = ''; out.appendChild(ui.callout('Imported ' + ok.length + ' records. ' + (id === 'customers' ? '<a href="#/customer360">Open customer master</a>' : '<a href="#/enquiries">Open enquiries</a>'), 'ok')); }, 'primary sm')] : null })));
+        out.appendChild(calloutH('<b>' + records.length + '</b> rows read · columns: ' + util.esc(header.join(', ')) + ' · <b>' + ok.length + '</b> ready · <b>' + (res.length - ok.length) + '</b> will be skipped', ok.length ? 'ok' : 'warn'));
+        out.appendChild(h('div', { class: 'mt' }, card('Preview', ui.table({ rows: res.map((r) => Object.assign({ status: r.ok ? 'Ready' : r.dup ? 'Duplicate' : 'Error', msg: r.msg }, r.d, { row: r.row })), search: false, pageSize: 10, columns: [{ key: 'row', label: 'Row' }].concat(imp.cols.map((k) => ({ key: k, label: k, render: (r) => (MONEY_COLS.includes(k) ? fmt.money(r[k]) : r[k] instanceof Date ? fmt.date(r[k]) : r[k]) })), [{ key: 'status', label: 'Status', render: (r) => ui.badge(r.status, r.status === 'Ready' ? 'ok' : r.status === 'Duplicate' ? 'warn' : 'bad') }, { key: 'msg', label: 'Validation' }]) }), { flush: true, actions: ok.length ? [ui.btn('Import ' + ok.length + ' rows', () => { ok.forEach((r) => commitImport(imp, r.d)); ui.toast(ok.length + ' ' + imp.label.toLowerCase() + ' records imported', 'ok'); ta.value = ''; out.innerHTML = ''; out.appendChild(calloutH('Imported ' + ok.length + ' records. ' + ('<a href="#/' + ({ customers: 'customer360', leads: 'enquiries', orders: 'orders', invoices: 'invoices', payments: 'payments' }[id] || 'enquiries') + '">Open ' + imp.label.toLowerCase() + '</a>'), 'ok')); }, 'primary sm')] : null })));
       }
       body.appendChild(card('Import ' + imp.label, h('div', { class: 'stack' }, [
-        ui.callout('Expected columns: <b>' + imp.header.join(', ') + '</b>. Dates as DD/MM/YYYY or YYYY-MM-DD. Header names are matched case-insensitively.', 'info'),
+        calloutH('Expected columns: <b>' + imp.header.join(', ') + '</b>. Dates as DD/MM/YYYY or YYYY-MM-DD. Header names are matched case-insensitively.', 'info'),
         h('div', { class: 'row' }, [ui.btn('⇩ Download template', () => downloadCsv(id + '-template.csv', imp.header, imp.sample), 'sm'), ui.btn('Load sample data', () => { ta.value = [imp.header].concat(imp.sample).map((r) => r.map(csvCell).join(',')).join('\n'); preview(); }, 'sm'), file]),
         ta, h('div', { class: 'row' }, [ui.btn('Preview & validate', preview, 'primary')]),
       ])));
@@ -1806,7 +2216,7 @@
         { key: 'hardCopySubmitted', label: 'Hard copy', render: (i) => yesNo(i.hardCopySubmitted) }, { key: 'invoiceMailed', label: 'Mailed', render: (i) => yesNo(i.invoiceMailed) },
         { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'st', label: 'Status', render: (i) => ui.badge(i.st, invTone(i.st)) },
       ],
-      actions: isAcc() ? (i) => [ui.btn('Update', () => raiseInvoice(db.get('orders', i.orderId) || { value: i.value / 1.18, accountName: i.accountName, customerId: i.customerId }, db.get('invoices', i.id)), 'sm'), i.os > 0 ? ui.btn('₹ Receipt', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null] : null,
+      actions: isAcc() ? (i) => [ui.btn('Update', () => raiseInvoice(db.get('orders', i.orderId) || { value: exGst(i.value, i.division), division: i.division, accountName: i.accountName, customerId: i.customerId }, db.get('invoices', i.id)), 'sm'), i.os > 0 ? ui.btn('₹ Receipt', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null] : null,
     });
   }
   function renderInvoices(el) {
@@ -1815,7 +2225,7 @@
     const mk = monthKey(CRM.TODAY);
     ui.page(el, { title: 'Invoices', sub: 'Accounts raises & updates invoices after SO approval — invoice date, number, value, hard copy, mail and confirmation tracked', actions: [ui.btn('⇩ Export CSV', () => downloadCsv('invoices.csv', ['Invoice Number', 'Invoice Date', 'SO Number', 'Account', 'Division', 'Invoice Value', 'Payment Terms', 'Payment Due Date', 'Received', 'Outstanding', 'Hard Copy Submitted', 'Invoice Mailed', 'Confirmed With', 'Status'], invs.map((i) => [i.invoiceNo, i.invoiceDate, i.soNumber, i.accountName, i.division, i.value, i.paymentTerms, i.dueDate, paidOf(i), outstandingOf(i), i.hardCopySubmitted ? 'Yes' : 'No', i.invoiceMailed ? 'Yes' : 'No', i.confirmedWith, invStatus(i)])))] });
     el.appendChild(ui.kpis([
-      { label: 'To be invoiced', value: toInv.length, meta: fmt.lakh(sum(toInv, (o) => o.value * 1.18)) + ' incl. GST', color: 'var(--warn)' },
+      { label: 'To be invoiced', value: toInv.length, meta: fmt.lakh(sum(toInv, invoiceDefault)) + ' incl. GST', color: 'var(--warn)' },
       { label: 'Invoiced this month', value: fmt.lakh(sum(invs.filter((i) => monthKey(i.invoiceDate) === mk), 'value')), color: 'var(--chart-5)' },
       { label: 'Hard copy not submitted', value: invs.filter((i) => !i.hardCopySubmitted && outstandingOf(i) > 0).length, color: 'var(--chart-4)' },
       { label: 'Not mailed', value: invs.filter((i) => !i.invoiceMailed).length, color: 'var(--chart-3)' },
@@ -1831,7 +2241,8 @@
   function renderPayments(el) {
     const invs = allInvoices(), pays = scope(db.all('payments'));
     const t = todayIso(), mk = monthKey(CRM.TODAY);
-    const dueSoon = invs.filter((i) => outstandingOf(i) > 0 && util.iso(i.dueDate) >= t && util.daysBetween(CRM.TODAY, i.dueDate) <= 3);
+    const dueWin = Number(cfg('sales.reminders').paymentDueDays) || 0;
+    const dueSoon = invs.filter((i) => outstandingOf(i) > 0 && util.iso(i.dueDate) >= t && util.daysBetween(CRM.TODAY, parseD(util.iso(i.dueDate))) <= dueWin);
     const overdue = invs.filter((i) => invStatus(i) === 'Overdue');
     ui.page(el, { title: 'Payments & Collections', sub: 'Payment terms, due date, received date & value, payment mode, outstanding (auto), invoice hard copy / mail, confirmed with', actions: [isAcc() || canWork() ? ui.btn('+ Record payment', () => recordPayment(), 'primary') : null] });
     el.appendChild(ui.kpis([
@@ -1841,12 +2252,12 @@
       { label: 'Overdue', value: fmt.lakh(sum(overdue, outstandingOf)), meta: overdue.length + ' invoices', color: 'var(--bad)' },
       { label: 'Field updates to verify', value: pays.filter((p) => !p.verified).length, color: 'var(--chart-4)' },
     ]));
-    if (dueSoon.length || overdue.length) el.appendChild(ui.callout('<b>Payment-due alerts:</b> ' + dueSoon.length + ' invoice(s) due within 3 days (' + fmt.lakh(sum(dueSoon, outstandingOf)) + ') and ' + overdue.length + ' overdue beyond credit policy (' + fmt.lakh(sum(overdue, outstandingOf)) + '). Reminders go to Accounts and the executive automatically.', overdue.length ? 'bad' : 'warn'));
+    if (dueSoon.length || overdue.length) el.appendChild(calloutH("<b>Payment-due alerts:</b> " + dueSoon.length + ' invoice(s) due within ' + dueWin + ' days (' + fmt.lakh(sum(dueSoon, outstandingOf)) + ') and ' + overdue.length + ' overdue beyond credit policy (' + fmt.lakh(sum(overdue, outstandingOf)) + '). Reminders go to Accounts and the executive automatically.', overdue.length ? 'bad' : 'warn'));
     section(el, ui.tabs([{ id: 'track', label: 'Payment tracking' }, { id: 'due', label: 'Due & overdue', count: dueSoon.length + overdue.length }, { id: 'rcpt', label: 'Receipts', count: pays.length }], (id, body) => {
       if (id === 'track') body.appendChild(card(null, ui.table({
         rows: () => invs.map((i) => { const ps = paymentsOf(i).sort((a, b) => (a.receivedDate < b.receivedDate ? 1 : -1)); return Object.assign({}, i, { last: ps[0] || {}, paid: paidOf(i), os: outstandingOf(i), st: invStatus(i) }); }).sort((a, b) => b.os - a.os),
         filters: [{ key: 'st', label: 'statuses', options: ['Paid', 'Partial', 'Unpaid', 'Due Today', 'Overdue'] }, { key: 'paymentTerms', label: 'terms', options: Object.keys(PAY_TERMS) }],
-        columns: [{ key: 'invoiceNo', label: 'Invoice', render: (i) => mono(i.invoiceNo) }, { key: 'accountName', label: 'Account' }, { key: 'paymentTerms', label: 'Payment terms' }, { key: 'dueDate', label: 'Payment due date', render: (i) => fmt.date(i.dueDate) }, { key: 'lr', label: 'Payment received date', render: (i) => fmt.date(i.last.receivedDate) }, { key: 'paid', label: 'Received value', cls: 'right', render: (i) => fmt.money(i.paid) }, { key: 'mode', label: 'Payment mode', render: (i) => i.last.mode || '—' }, { key: 'os', label: 'Outstanding (auto)', cls: 'right', render: (i) => h('b', {}, fmt.money(i.os)), footer: (rs) => fmt.lakh(sum(rs, 'os')) }, { key: 'hardCopySubmitted', label: 'Hard copy submitted', render: (i) => yesNo(i.hardCopySubmitted) }, { key: 'invoiceMailed', label: 'Invoice mailed', render: (i) => yesNo(i.invoiceMailed) }, { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'st', label: 'Status', render: (i) => ui.badge(i.st, invTone(i.st)) }],
+        columns: [{ key: 'invoiceNo', label: 'Invoice', render: (i) => mono(i.invoiceNo) }, { key: 'accountName', label: 'Account' }, { key: 'paymentTerms', label: 'Payment terms' }, { key: 'dueDate', label: 'Payment due date', render: (i) => fmt.date(i.dueDate) }, { key: 'lr', label: 'Payment received date', render: (i) => fmt.date(i.last.receivedDate) }, { key: 'paid', label: 'Received value (verified)', cls: 'right', render: (i) => h('div', {}, [fmt.money(i.paid), pendingOf(i) ? h('div', { class: 'small muted' }, '+ ' + fmt.money(pendingOf(i)) + ' to verify') : null]) }, { key: 'mode', label: 'Payment mode', render: (i) => i.last.mode || '—' }, { key: 'os', label: 'Outstanding (auto)', cls: 'right', render: (i) => h('b', {}, fmt.money(i.os)), footer: (rs) => fmt.lakh(sum(rs, 'os')) }, { key: 'hardCopySubmitted', label: 'Hard copy submitted', render: (i) => yesNo(i.hardCopySubmitted) }, { key: 'invoiceMailed', label: 'Invoice mailed', render: (i) => yesNo(i.invoiceMailed) }, { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'st', label: 'Status', render: (i) => ui.badge(i.st, invTone(i.st)) }],
         actions: (i) => (i.os > 0 && (isAcc() || canWork()) ? [ui.btn('₹', () => recordPayment(db.get('invoices', i.id)), 'sm primary')] : []),
       }), { flush: true }));
       if (id === 'due') body.appendChild(card(null, invoiceTable(dueSoon.concat(overdue)), { flush: true }));
@@ -1854,7 +2265,7 @@
         rows: () => pays.map((p) => Object.assign({}, p, { inv: (db.get('invoices', p.invoiceId) || {}).invoiceNo, policy: p.onTime ? 'On time' : 'Late' })).sort((a, b) => (a.receivedDate < b.receivedDate ? 1 : -1)),
         filters: [{ key: 'mode', label: 'modes', options: PAY_MODES }, { key: 'policy', label: 'policy', options: ['On time', 'Late'] }],
         columns: [{ key: 'id', label: 'Receipt', render: (p) => mono(p.id) }, { key: 'receivedDate', label: 'Received', render: (p) => fmt.date(p.receivedDate) }, { key: 'inv', label: 'Invoice', render: (p) => mono(p.inv) }, { key: 'accountName', label: 'Account' }, { key: 'value', label: 'Value', cls: 'right', render: (p) => fmt.money(p.value), footer: (rs) => fmt.lakh(sum(rs, 'value')) }, { key: 'mode', label: 'Mode' }, { key: 'reference', label: 'Reference' }, { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'policy', label: 'As per policy', render: (p) => ui.badge(p.policy, p.onTime ? 'ok' : 'warn') }, { key: 'recordedBy', label: 'Recorded by' }, { key: 'verified', label: 'Verified', render: (p) => ui.badge(p.verified ? 'Verified' : 'Pending', p.verified ? 'ok' : 'warn') }],
-        actions: isAcc() ? (p) => (!p.verified ? [ui.btn('Verify', () => { db.update('payments', p.id, { verified: true, verifiedBy: CRM.user().name }, { note: 'Payment verified by Accounts' }); ui.toast('Payment verified', 'ok'); CRM.refresh(); }, 'sm ok')] : []) : null,
+        actions: isAcc() ? (p) => (!p.verified ? [ui.btn('Verify', () => { const inv = db.get('invoices', p.invoiceId); if (inv && p.value > outstandingOf(inv)) { ui.toast('Receipt exceeds the invoice outstanding of ' + fmt.money(outstandingOf(inv)) + ' — check for a duplicate entry', 'bad'); return; } db.update('payments', p.id, { verified: true, verifiedBy: CRM.user().name, verifiedAt: nowIso() }, { note: 'Payment verified by Accounts' }); ui.toast('Payment verified · outstanding updated', 'ok'); CRM.refresh(); }, 'sm ok')] : []) : null,
       }), { flush: true }));
     }));
   }
@@ -1874,7 +2285,7 @@
       rows: () => invs.map((i) => Object.assign({}, i, { os: outstandingOf(i), od: Math.max(0, overdueDays(i)), bucket: ageBucket(i), execName: execName(i.execId) })).sort((a, b) => b.od - a.od),
       filters: [{ key: 'bucket', label: 'buckets', options: BUCKETS }, { key: 'division', label: 'divisions', options: DIVS }],
       columns: [{ key: 'invoiceNo', label: 'Invoice', render: (i) => mono(i.invoiceNo) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (i) => ui.divTag(i.division) }, { key: 'dueDate', label: 'Due', render: (i) => fmt.date(i.dueDate) }, { key: 'od', label: 'Days overdue', render: (i) => ui.badge(i.od ? i.od + ' d' : 'Not due', i.od > 60 ? 'bad' : i.od > 0 ? 'warn' : 'ok') }, { key: 'os', label: 'Outstanding', cls: 'right', render: (i) => fmt.money(i.os), footer: (rs) => fmt.lakh(sum(rs, 'os')) }, { key: 'confirmedWith', label: 'Confirmed with' }, { key: 'execName', label: 'Executive' }],
-      actions: (i) => { const e = db.one('enquiries', (x) => x.id === (db.get('orders', i.orderId) || {}).enquiryId) || { id: '', contactNumber: (master.customer(i.customerId) || {}).phone, email: (master.customer(i.customerId) || {}).email }; const txt = 'A gentle reminder: invoice ' + i.invoiceNo + ' for ' + fmt.money(i.os) + (new Date(i.dueDate) < CRM.TODAY ? ' was due on ' : ' is due on ') + fmt.date(i.dueDate) + '. — Team Maruthi, Accounts'; return [ui.btn('💬', () => sendWhatsApp(e.id, e.contactNumber, txt), 'sm'), ui.btn('✉', () => sendEmail(e.id, e.email, 'Payment reminder ' + i.invoiceNo, txt), 'sm'), (isAcc() || canWork()) ? ui.btn('₹', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null]; },
+      actions: (i) => { const e = db.one('enquiries', (x) => x.id === (db.get('orders', i.orderId) || {}).enquiryId) || { id: '', contactNumber: (master.customer(i.customerId) || {}).phone, email: (master.customer(i.customerId) || {}).email }; const txt = 'A gentle reminder: invoice ' + i.invoiceNo + ' for ' + fmt.money(i.os) + (parseD(util.iso(i.dueDate)) < CRM.TODAY ? ' was due on ' : ' is due on ') + fmt.date(i.dueDate) + '. — Team Maruthi, Accounts'; return [ui.btn('💬', () => sendWhatsApp(e.id, e.contactNumber, txt), 'sm'), ui.btn('✉', () => sendEmail(e.id, e.email, 'Payment reminder ' + i.invoiceNo, txt), 'sm'), (isAcc() || canWork()) ? ui.btn('₹', () => recordPayment(db.get('invoices', i.id)), 'sm primary') : null]; },
     }), { flush: true }));
   }
 
@@ -1890,7 +2301,7 @@
     { id: 'd1', group: 'Daily', title: 'Enquiries received & prospects', build(f) { const rows = fdiv(allEnq(), f).filter((e) => inRange(e.date, f.from, f.to)); const pros = rows.filter((e) => OPEN.includes(e.stage)); return { kpis: [{ label: 'Enquiries received', value: rows.length }, { label: 'Active prospects', value: pros.length, meta: fmt.lakh(sum(pros, 'expectedValue')) }].concat(DIVS.map((d) => ({ label: d, value: rows.filter((e) => e.division === d).length, color: master.divisionColor(d) }))), rows, columns: [{ label: 'Enquiry No', get: (e) => e.id }, { label: 'Date', get: (e) => e.date }, { label: 'Account', get: (e) => e.accountName }, { label: 'Division', get: (e) => e.division }, { label: 'Product', get: (e) => e.product + ' × ' + e.quantity }, { label: 'Expected value', get: (e) => e.expectedValue, render: (e) => fmt.money(e.expectedValue) }, { label: 'Source', get: (e) => e.salesChannel }, { label: 'Lead source', get: (e) => e.leadSource }, { label: 'Executive', get: (e) => execName(e.execId) }, { label: 'Stage', get: (e) => e.stage, render: (e) => stageBadge(e.stage) }] }; } },
     { id: 'd2', group: 'Daily', title: 'Quotations sent', build(f) { const rows = fdiv(allQuotes(), f).filter((q) => inRange(q.quoteDate, f.from, f.to)); return { kpis: [{ label: 'Quotations sent', value: rows.length }, { label: 'Quoted value', value: fmt.lakh(sum(rows, 'quoteValue')) }], rows, columns: [{ label: 'Quote No', get: (q) => q.id }, { label: 'Given date', get: (q) => util.iso(q.quoteDate) }, { label: 'Account', get: (q) => q.accountName }, { label: 'Division', get: (q) => q.division }, { label: 'Quote value', get: (q) => q.quoteValue, render: (q) => fmt.money(q.quoteValue) }, { label: 'Status', get: (q) => q.status, render: (q) => ui.badge(q.status) }, { label: 'Executive', get: (q) => execName(q.execId) }] }; } },
     { id: 'd3', group: 'Daily', title: 'Quotation response time', build(f) { const rows = fdiv(allQuotes(), f).filter((q) => inRange(q.quoteDate, f.from, f.to)); const r = rows.map(quoteResponseHrs); return { kpis: [{ label: 'Average response', value: hrsText(avg(r)) }, { label: 'Within 24 h', value: fmt.pct(util.pct(r.filter((x) => x <= 24).length, r.length)), color: 'var(--ok)' }, { label: 'Breached (> 24 h)', value: r.filter((x) => x > 24).length, color: 'var(--bad)' }], rows, columns: [{ label: 'Quote No', get: (q) => q.id }, { label: 'Enquiry', get: (q) => q.enquiryId }, { label: 'Account', get: (q) => q.accountName }, { label: 'Enquiry created', get: (q) => fmt.dateTime((db.get('enquiries', q.enquiryId) || {}).createdAt) }, { label: 'Quote given', get: (q) => fmt.dateTime(q.quoteDate) }, { label: 'Response (h)', get: (q) => quoteResponseHrs(q), render: (q) => respBadge(quoteResponseHrs(q)) }, { label: 'Executive', get: (q) => execName(q.execId) }] }; } },
-    { id: 'd4', group: 'Daily', title: 'Orders won', build(f) { const rows = fdiv(allOrders(), f).filter((o) => inRange(o.wonDate, f.from, f.to)); return { kpis: [{ label: 'Orders won', value: rows.length }, { label: 'Order value', value: fmt.lakh(sum(rows, 'value')), color: 'var(--ok)' }, { label: 'New customers', value: rows.filter((o) => o.newCustomer).length }], rows, columns: [{ label: 'Order', get: (o) => o.id }, { label: 'Won date', get: (o) => util.iso(o.wonDate) }, { label: 'SO number', get: (o) => o.soNumber }, { label: 'PO number', get: (o) => o.poNumber }, { label: 'Account', get: (o) => o.accountName }, { label: 'Division', get: (o) => o.division }, { label: 'Product', get: (o) => o.product }, { label: 'Value', get: (o) => o.value, render: (o) => fmt.money(o.value) }, { label: 'Executive', get: (o) => execName(o.execId) }] }; } },
+    { id: 'd4', group: 'Daily', title: 'Orders won', build(f) { const rows = fdiv(allOrders(), f).filter((o) => o.approval === 'Approved' && inRange(o.wonDate, f.from, f.to)); const pend = fdiv(allOrders(), f).filter((o) => o.approval === 'Awaiting Approval' && inRange(o.wonDate, f.from, f.to)); return { kpis: [{ label: 'Orders won (SO approved)', value: rows.length }, { label: 'Order value', value: fmt.lakh(sum(rows, 'value')), color: 'var(--ok)' }, { label: 'New customers', value: acquisitions(f.from, f.to, (o) => (!f.division || o.division === f.division) && (!isExec() || o.execId === me())).length }, { label: 'Awaiting SO approval', value: pend.length, meta: fmt.lakh(sum(pend, 'value')), color: 'var(--warn)' }], rows, columns: [{ label: 'Order', get: (o) => o.id }, { label: 'Won date', get: (o) => util.iso(o.wonDate) }, { label: 'SO number', get: (o) => o.soNumber }, { label: 'PO number', get: (o) => o.poNumber }, { label: 'Account', get: (o) => o.accountName }, { label: 'Division', get: (o) => o.division }, { label: 'Product', get: (o) => o.product }, { label: 'Value', get: (o) => o.value, render: (o) => fmt.money(o.value) }, { label: 'Executive', get: (o) => execName(o.execId) }] }; } },
     { id: 'd5', group: 'Daily', title: 'Sales order processing time', build(f) { const rows = fdiv(allOrders(), f).filter((o) => inRange(o.soIssuedDate, f.from, f.to)); const r = rows.map(soProcessingHrs); return { kpis: [{ label: 'SOs issued', value: rows.length }, { label: 'Average SO processing', value: hrsText(avg(r)) }, { label: '> 24 h after approval', value: r.filter((x) => x > 24).length, color: 'var(--bad)' }], rows, columns: [{ label: 'SO number', get: (o) => o.soNumber }, { label: 'Account', get: (o) => o.accountName }, { label: 'Order won', get: (o) => fmt.dateTime(o.wonDate) }, { label: 'SO issued', get: (o) => fmt.dateTime(o.soIssuedDate) }, { label: 'Processing (h)', get: (o) => soProcessingHrs(o), render: (o) => respBadge(soProcessingHrs(o)) }, { label: 'Material', get: (o) => o.materialAvailability }] }; } },
     { id: 'd6', group: 'Daily', title: 'Payment to collect today', build(f) { const rows = fdiv(allInvoices(), f).filter((i) => outstandingOf(i) > 0 && util.iso(i.dueDate) <= f.to).sort((a, b) => (a.dueDate > b.dueDate ? 1 : -1)); const dueNow = rows.filter((i) => util.iso(i.dueDate) >= f.from); return { kpis: [{ label: 'Due in period', value: fmt.lakh(sum(dueNow, outstandingOf)), meta: dueNow.length + ' invoices', color: 'var(--warn)' }, { label: 'Overdue carried forward', value: fmt.lakh(sum(rows.filter((i) => util.iso(i.dueDate) < f.from), outstandingOf)), color: 'var(--bad)' }, { label: 'Total to collect', value: fmt.lakh(sum(rows, outstandingOf)) }], rows, columns: [{ label: 'Invoice', get: (i) => i.invoiceNo }, { label: 'Account', get: (i) => i.accountName }, { label: 'Due date', get: (i) => i.dueDate }, { label: 'Days overdue', get: (i) => Math.max(0, overdueDays(i)) }, { label: 'Outstanding', get: (i) => outstandingOf(i), render: (i) => fmt.money(outstandingOf(i)) }, { label: 'Confirmed with', get: (i) => i.confirmedWith }, { label: 'Executive', get: (i) => execName(i.execId) }] }; } },
     { id: 'd7', group: 'Daily', title: 'Payment collected as per policy', build(f) { const rows = fdiv(scope(db.all('payments')), f).filter((p) => inRange(p.receivedDate, f.from, f.to)); const on = rows.filter((p) => p.onTime); return { kpis: [{ label: 'Collected', value: fmt.lakh(sum(rows, 'value')) }, { label: 'As per policy (on/before due)', value: fmt.lakh(sum(on, 'value')), meta: util.pct(on.length, rows.length) + '% of receipts', color: 'var(--ok)' }, { label: 'Late collections', value: rows.length - on.length, color: 'var(--bad)' }], rows, columns: [{ label: 'Receipt', get: (p) => p.id }, { label: 'Date', get: (p) => p.receivedDate }, { label: 'Account', get: (p) => p.accountName }, { label: 'Value', get: (p) => p.value, render: (p) => fmt.money(p.value) }, { label: 'Mode', get: (p) => p.mode }, { label: 'Due date', get: (p) => (db.get('invoices', p.invoiceId) || {}).dueDate }, { label: 'As per policy', get: (p) => (p.onTime ? 'Yes' : 'No'), render: (p) => ui.badge(p.onTime ? 'On time' : 'Late', p.onTime ? 'ok' : 'bad') }] }; } },
@@ -1913,24 +2324,41 @@
     { id: 'm4', group: 'Monthly', title: 'Executive-wise cold call performance', build(f) { const rows = tvaExecRows(f).map((r, i) => Object.assign(r, { enq: db.find('callLogs', (c) => c.execId === repExecs(f)[i].id && c.type === 'Cold Call' && c.outcome === 'Enquiry Generated' && inRange(c.date, f.from, f.to)).length })); return { kpis: [{ label: 'Cold calls', value: sum(rows, (r) => r.a.coldCalls) + ' / ' + Math.round(sum(rows, (r) => r.t.coldCalls)) }, { label: 'Enquiries generated', value: sum(rows, 'enq'), color: 'var(--ok)' }], rows, columns: tvaColumns(['coldCalls']).concat([{ label: 'Enquiries generated', get: (r) => r.enq }, { label: 'Hit rate', get: (r) => util.pct(r.enq, r.a.coldCalls) + '%' }]) }; } },
     { id: 'm5', group: 'Monthly', title: 'Executive-wise upselling performance', build(f) { const rows = tvaExecRows(f).map((r, i) => Object.assign(r, { val: sum(db.find('upsells', (u) => u.execId === repExecs(f)[i].id && u.type === 'Upsell' && u.status === 'Converted' && inRange(u.convertedAt, f.from, f.to)), 'value') })); return { kpis: [{ label: 'Upsells', value: sum(rows, (r) => r.a.upsell) + ' / ' + Math.round(sum(rows, (r) => r.t.upsell)) }, { label: 'Upsell value', value: fmt.lakh(sum(rows, 'val')) }], rows, columns: tvaColumns(['upsell']).concat([{ label: 'Upsell value', get: (r) => r.val, render: (r) => fmt.money(r.val) }]) }; } },
     { id: 'm6', group: 'Monthly', title: 'Executive-wise cross selling performance', build(f) { const rows = tvaExecRows(f).map((r, i) => Object.assign(r, { val: sum(db.find('upsells', (u) => u.execId === repExecs(f)[i].id && u.type === 'Cross-sell' && u.status === 'Converted' && inRange(u.convertedAt, f.from, f.to)), 'value') })); return { kpis: [{ label: 'Cross-sells', value: sum(rows, (r) => r.a.crossSell) + ' / ' + Math.round(sum(rows, (r) => r.t.crossSell)) }, { label: 'Cross-sell value', value: fmt.lakh(sum(rows, 'val')) }], rows, columns: tvaColumns(['crossSell']).concat([{ label: 'Cross-sell value', get: (r) => r.val, render: (r) => fmt.money(r.val) }]) }; } },
-    { id: 'm7', group: 'Monthly', title: 'New customer acquisition', build(f) { const rows = fdiv(allOrders(), f).filter((o) => o.newCustomer && o.approval === 'Approved' && inRange(o.wonDate, f.from, f.to)); const t = repExecs(f).reduce((s, x) => s + targetFor('exec', x.id, f.from, f.to).newCustomers, 0); return { kpis: [{ label: 'New customers acquired', value: rows.length + ' / ' + Math.round(t), meta: 'vs target' }, { label: 'Value', value: fmt.lakh(sum(rows, 'value')), color: 'var(--ok)' }].concat(repExecs(f).map((s) => ({ label: s.name, value: rows.filter((o) => o.execId === s.id).length }))), rows, columns: [{ label: 'Customer', get: (o) => o.accountName }, { label: 'Customer ID', get: (o) => o.customerId }, { label: 'Won date', get: (o) => util.iso(o.wonDate) }, { label: 'Division', get: (o) => o.division }, { label: 'Channel', get: (o) => o.salesChannel }, { label: 'Value', get: (o) => o.value, render: (o) => fmt.money(o.value) }, { label: 'Executive', get: (o) => execName(o.execId) }] }; } },
+    { id: 'm7', group: 'Monthly', title: 'New customer acquisition', build(f) { const rows = acquisitions(f.from, f.to, (o) => (!f.division || o.division === f.division) && (!isExec() || o.execId === me())); const t = repExecs(f).reduce((s2, x) => s2 + targetFor('exec', x.id, f.from, f.to).newCustomers, 0); return { kpis: [{ label: 'New customers acquired (distinct)', value: rows.length + ' / ' + Math.round(t), meta: 'vs target · first approved order in period' }, { label: 'First-order value', value: fmt.lakh(sum(rows, 'value')), color: 'var(--ok)' }].concat(repExecs(f).map((s2) => ({ label: s2.name, value: rows.filter((o) => o.execId === s2.id).length }))), rows, columns: [{ label: 'Customer', get: (o) => o.accountName }, { label: 'Customer ID', get: (o) => o.customerId }, { label: 'First order won', get: (o) => util.iso(o.wonDate) }, { label: 'Division', get: (o) => o.division }, { label: 'Channel', get: (o) => o.salesChannel }, { label: 'Value', get: (o) => o.value, render: (o) => fmt.money(o.value) }, { label: 'Executive', get: (o) => execName(o.execId) }, { label: 'Customer type now', get: (o) => (master.customer(o.customerId) || {}).type || '' }] }; } },
   ];
   function presetRange(group) {
     const t = todayIso();
     if (group === 'Daily') return [t, t];
-    if (group === 'Weekly') return [util.iso(util.addDays(CRM.TODAY, -6)), t];
+    if (group === 'Weekly') return weekRange(CRM.TODAY); // calendar week Mon → Sun
     return [monthRange(monthKey(CRM.TODAY))[0], t];
   }
+  // admin can switch reports on/off in Settings & Rules → Reports (Core v2 registerReport / config.reportEnabled)
+  if (CRM.registerReport) REPORTS.forEach((r) => CRM.registerReport({ id: 'sales-' + r.id, title: r.title, group: 'Sales · ' + r.group, link: '#/salesreports/' + r.id }));
+  const reportOn = (r) => { try { return !(CRM.config && CRM.config.reportEnabled) || CRM.config.reportEnabled('sales-' + r.id); } catch (err) { return true; } };
+  // division-wide reports are management views — executives get their own figures only
+  const DIV_REPORTS = ['w2', 'm2'];
+  const visibleReports = () => REPORTS.filter((r) => reportOn(r) && !(isExec() && DIV_REPORTS.includes(r.id)));
+  function printReport(title, node) {
+    if (CRM.exportPdf) { CRM.exportPdf(title, node); return; }
+    const w = window.open('', '_blank');
+    if (!w) { window.print(); return; }
+    const css = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).map((l) => '<link rel="stylesheet" href="' + util.esc(l.href) + '">').join('');
+    w.document.write('<!doctype html><html><head><meta charset="utf-8"><title>' + util.esc(title) + '</title>' + css + '<style>body{padding:24px;background:#fff}.btn,.filters,.tbl-foot button{display:none!important}</style></head><body><h1>' + util.esc(title) + '</h1>' + node.outerHTML + '</body></html>');
+    w.document.close();
+    setTimeout(() => { try { w.focus(); w.print(); } catch (err) { /* user can print manually */ } }, 400);
+  }
   function renderReports(el, params) {
-    let rep = REPORTS.find((r) => r.id === (params && params[0])) || REPORTS[0];
+    const vis = visibleReports();
+    if (!vis.length) { ui.page(el, { title: 'Sales Report Centre' }); el.appendChild(ui.empty('All sales reports are switched off in Settings & Rules → Reports', '📊')); return; }
+    let rep = vis.find((r) => r.id === (params && params[0])) || vis[0];
     const [f0, t0] = presetRange(rep.group);
     const f = { from: f0, to: t0, division: '' };
-    ui.page(el, { title: 'Sales Report Centre', sub: '10 daily · 2 weekly · 7 monthly reports with date & division filters and CSV export' + (isExec() ? ' · showing your own data' : '') });
+    ui.page(el, { title: 'Sales Report Centre', sub: '10 daily · 2 weekly (calendar week) · 7 monthly reports with date & division filters, CSV and PDF export' + (isExec() ? ' · showing your own data' : '') });
     const nav = h('div', { class: 'stack', style: 'gap:2px' });
     const out = h('div');
     ['Daily', 'Weekly', 'Monthly'].forEach((g) => {
       nav.appendChild(h('div', { class: 'small muted', style: 'font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin:8px 0 4px' }, g + ' reports'));
-      REPORTS.filter((r) => r.group === g).forEach((r, i) => nav.appendChild(h('a', { href: '#/salesreports/' + r.id, class: 'btn ' + (r.id === rep.id ? 'primary' : 'ghost'), style: 'justify-content:flex-start;white-space:normal;text-align:left' }, (i + 1) + '. ' + r.title)));
+      visibleReports().filter((r) => r.group === g).forEach((r, i) => nav.appendChild(h('a', { href: '#/salesreports/' + r.id, class: 'btn ' + (r.id === rep.id ? 'primary' : 'ghost'), style: 'justify-content:flex-start;white-space:normal;text-align:left' }, (i + 1) + '. ' + r.title)));
     });
     const fromI = h('input', { type: 'date', value: f.from }), toI = h('input', { type: 'date', value: f.to });
     const divS = h('select', {}, [h('option', { value: '' }, 'All divisions')].concat(DIVS.map((d) => h('option', { value: d }, d))));
@@ -1938,12 +2366,14 @@
     const setR = (a, b) => { f.from = a; f.to = b; fromI.value = a; toI.value = b; draw(); };
     const lm = (() => { const d = new Date(CRM.TODAY); d.setDate(1); d.setMonth(d.getMonth() - 1); return monthRange(monthKey(d)); })();
     let built;
-    const bar = h('div', { class: 'filters' }, [h('span', { class: 'small muted' }, 'From'), fromI, h('span', { class: 'small muted' }, 'To'), toI, divS, ui.btn('Today', () => setR(todayIso(), todayIso()), 'sm'), ui.btn('Last 7 days', () => setR(util.iso(util.addDays(CRM.TODAY, -6)), todayIso()), 'sm'), ui.btn('This month', () => setR(monthRange(monthKey(CRM.TODAY))[0], todayIso()), 'sm'), ui.btn('Last month', () => setR(lm[0], lm[1]), 'sm'), h('span', { style: 'flex:1' }), ui.btn('⇩ Export CSV', () => downloadCsv(rep.id + '-' + rep.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + f.from + '_' + f.to + '.csv', built.columns.map((c) => c.label), built.rows.map((r) => built.columns.map((c) => c.get(r)))), 'sm primary'), ui.btn('🖶 Print', () => window.print(), 'sm')]);
+    const bar = h('div', { class: 'filters' }, [h('span', { class: 'small muted' }, 'From'), fromI, h('span', { class: 'small muted' }, 'To'), toI, divS, ui.btn('Today', () => setR(todayIso(), todayIso()), 'sm'), ui.btn('This week', () => { const [a, b] = weekRange(CRM.TODAY); setR(a, b); }, 'sm'), ui.btn('Last week', () => { const [a, b] = weekRange(util.addDays(CRM.TODAY, -7)); setR(a, b); }, 'sm'), ui.btn('This month', () => setR(monthRange(monthKey(CRM.TODAY))[0], todayIso()), 'sm'), ui.btn('Last month', () => setR(lm[0], lm[1]), 'sm'), h('span', { style: 'flex:1' }), ui.btn('⇩ Export CSV', () => downloadCsv(rep.id + '-' + rep.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + f.from + '_' + f.to + '.csv', built.columns.map((c) => c.label), built.rows.map((r) => built.columns.map((c) => c.get(r)))), 'sm primary'), ui.btn('⇩ PDF', () => printReport(rep.group + ' · ' + rep.title + ' · ' + fmt.date(parseD(f.from)) + ' → ' + fmt.date(parseD(f.to)) + (f.division ? ' · ' + f.division : ''), pdfNode()), 'sm'), ui.btn('🖶 Print', () => window.print(), 'sm')]);
+    // printable copy of the current report with all rows (the on-screen table is paginated)
+    const pdfNode = () => h('div', {}, [ui.kpis(built.kpis), h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, built.columns.map((c) => h('th', {}, c.label)))), h('tbody', {}, built.rows.map((r) => h('tr', {}, built.columns.map((c) => { const v = c.get(r); return h('td', {}, v == null || v === '' ? '—' : String(v)); }))))])]);
     el.appendChild(h('div', { class: 'grid g3' }, [card('Reports', nav), h('div', { class: 'span2' }, card(null, h('div', {}, [bar, h('div', { class: 'card-body' }, out)]), { flush: true }))]));
     function draw() {
       out.innerHTML = '';
       built = rep.build(f);
-      out.appendChild(h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:10px' }, [h('h2', {}, rep.group + ' · ' + rep.title), h('span', { class: 'small muted' }, fmt.date(f.from) + ' → ' + fmt.date(f.to) + (f.division ? ' · ' + f.division : ''))]));
+      out.appendChild(h('div', { class: 'row', style: 'justify-content:space-between;margin-bottom:10px' }, [h('h2', {}, rep.group + ' · ' + rep.title), h('span', { class: 'small muted' }, fmt.date(parseD(f.from)) + ' → ' + fmt.date(parseD(f.to)) + (f.division ? ' · ' + f.division : ''))]));
       out.appendChild(ui.kpis(built.kpis));
       if (built.chart) out.appendChild(h('div', { style: 'margin-bottom:12px' }, built.chart));
       out.appendChild(ui.table({ rows: built.rows, pageSize: 12, columns: built.columns.map((c, i) => ({ key: 'c' + i, label: c.label, render: c.render || ((r) => { const v = c.get(r); return v == null || v === '' ? '—' : String(v); }), sort: (r) => c.get(r) })) }));
@@ -1979,10 +2409,10 @@
     ui.page(el, { title: 'Sales SLA & Escalations', sub: 'Policy violations auto-detected and escalated: Sales Executive → Sales Coordinator → Sales Head → Management', actions: [ui.btn('⇩ Export CSV', () => downloadCsv('sales-sla-violations.csv', ['Type', 'Policy', 'Record', 'Division', 'Owner', 'Hours over SLA', 'Escalation level', 'Severity', 'Details'], list.map((b) => [b.type, b.ref, b.rec.id, b.division, execName(b.owner), Math.round(b.over), LEVELS[b.level].label, b.severity, b.details])))] });
     el.appendChild(ui.kpis(types.map((t, i) => ({ label: t, value: list.filter((b) => b.type === t).length, color: ['var(--chart-1)', 'var(--chart-4)', 'var(--warn)', 'var(--bad)', 'var(--chart-3)'][i] }))));
     el.appendChild(h('div', { class: 'grid g3' }, [
-      h('div', { class: 'span2' }, card('Open violations', ui.table({ rows: list.map((b) => ({ id: b.rec.id, type: b.type, ref: b.ref, division: b.division, owner: execName(b.owner), over: b.over, level: LEVELS[b.level].label, lv: b.level, severity: b.severity, details: b.details, link: b.link })), onRow: (r) => { location.hash = r.link; }, filters: [{ key: 'type', label: 'types', options: types }, { key: 'division', label: 'divisions', options: DIVS }], columns: [{ key: 'type', label: 'Violation', render: (r) => h('div', {}, [h('b', {}, r.type), h('div', { class: 'small muted' }, r.ref)]) }, { key: 'id', label: 'Record', render: (r) => mono(r.id) }, { key: 'division', label: 'Division', render: (r) => ui.divTag(r.division) }, { key: 'owner', label: 'Owner' }, { key: 'over', label: 'Over SLA by', render: (r) => hrsText(r.over), sort: (r) => r.over }, { key: 'level', label: 'Escalated to', render: (r) => ui.badge(r.level, r.lv >= 3 ? 'bad' : 'warn') }, { key: 'severity', label: 'Severity', render: (r) => ui.badge(r.severity, r.severity === 'Low' ? 'info' : 'warn') }, { key: 'details', label: 'Details' }] }), { flush: true })),
+      h('div', { class: 'span2' }, card('Open violations', ui.table({ rows: list.map((b) => ({ id: b.rec.id, type: b.type, ref: b.ref, division: b.division, owner: execName(b.owner), over: b.over, overDays: b.overDays, level: LEVELS[b.level].label, lv: b.level, severity: b.severity, details: b.details, link: (b.links || [b.link]).find((l) => canOpen(l, CRM.role().id)) || '' })), onRow: (r) => { if (r.link) location.hash = r.link; else ui.toast('This record opens in a page your role cannot access', 'warn'); }, filters: [{ key: 'type', label: 'types', options: types }, { key: 'division', label: 'divisions', options: DIVS }], columns: [{ key: 'type', label: 'Violation', render: (r) => h('div', {}, [h('b', {}, r.type), h('div', { class: 'small muted' }, r.ref)]) }, { key: 'id', label: 'Record', render: (r) => mono(r.id) }, { key: 'division', label: 'Division', render: (r) => ui.divTag(r.division) }, { key: 'owner', label: 'Owner' }, { key: 'over', label: 'Over SLA by', render: (r) => (r.overDays != null ? r.overDays + ' d' : hrsText(r.over)), sort: (r) => r.over }, { key: 'level', label: 'Escalated to', render: (r) => ui.badge(r.level, r.lv >= 3 ? 'bad' : 'warn') }, { key: 'severity', label: 'Severity', render: (r) => ui.badge(r.severity, r.severity === 'Low' ? 'info' : 'warn') }, { key: 'details', label: 'Details' }] }), { flush: true })),
       h('div', { class: 'stack' }, [
-        card('Policy rules (Service_requirement §4–5)', ui.dl([['4.1 Quotation delay', 'No quotation 24 h after enquiry'], ['4.2 Site visit delay', 'Site visit not done in 24 h'], ['4.3 Customer approval pending SO', 'SO not issued 24 h after customer approval'], ['5.2 Payment collection delay', 'Not received within customer credit days'], ['5.3 Scrap collection delay', 'Scrap not collected 24 h after installation (Power)']])),
-        card('Escalation matrix', ui.timeline([{ when: 'SLA breach', title: 'L1 · Sales Executive', color: 'var(--chart-5)' }, { when: '+6 h', title: 'L2 · Sales Coordinator', color: 'var(--warn)' }, { when: '+12 h', title: 'L3 · Sales Head (Sales Manager)', color: 'var(--chart-3)' }, { when: '+48 h', title: 'L4 · Management (GM)', color: 'var(--bad)' }])),
+        card('Policy rules (Service_requirement §4–5)', ui.dl([['4.1 Quotation delay', 'No quotation ' + SLA.quoteHrs + ' h after enquiry'], ['4.2 Site visit delay', 'Site visit not done in ' + SLA.siteVisitHrs + ' h'], ['4.3 Customer approval pending SO', 'SO not issued ' + SLA.soHrs + ' h after customer approval'], ['5.2 Payment collection delay', 'Not received within customer credit days'], ['5.3 Scrap collection delay', 'Scrap not collected ' + SLA.scrapHrs + ' h after installation (Power)']])),
+        (() => { const esc = cfg('sales.escalation'), pe = cfg('sales.paymentEscalation'); return card('Escalation matrix', h('div', { class: 'stack' }, [ui.timeline([{ when: 'SLA breach', title: 'L1 · Sales Executive', color: 'var(--chart-5)' }, { when: '+' + esc.l2 + ' h', title: 'L2 · Sales Coordinator', color: 'var(--warn)' }, { when: '+' + esc.l3 + ' h', title: 'L3 · Sales Head (Sales Manager)', color: 'var(--chart-3)' }, { when: '+' + esc.l4 + ' h', title: 'L4 · Management (GM / ODM)', color: 'var(--bad)' }]), h('div', { class: 'small muted' }, 'Payment collection delays escalate by days overdue: L2 after ' + pe.l2 + ' d · L3 after ' + pe.l3 + ' d · L4 after ' + pe.l4 + ' d. Thresholds are configurable in Settings & Rules.')])); })(),
       ]),
     ]));
   }
@@ -2076,7 +2506,7 @@
     const fus = db.all('followups').filter((f) => f.status === 'Planned');
     el.appendChild(ui.hero(CRM.role(), ['Lead assignment', 'Sales OTS desk', 'Escalation L2', b.length + ' open SLA violations']));
     el.appendChild(ui.kpis([
-      { label: 'Awaiting assignment', value: unassigned.length + pendingOts().length, meta: pendingOts().length + ' Sales OTS', color: 'var(--chart-4)', onClick: () => CRM.go('enquiries') },
+      { label: 'Awaiting assignment', value: unassigned.length + pendingOts().length, meta: pendingOts().length + ' Sales OTS', color: 'var(--chart-4)', onClick: () => CRM.go(pendingOts().length ? 'salesots' : 'enquiries') },
       { label: 'Quotation delays', value: b.filter((x) => x.type === 'Quotation Delay').length, meta: '> 24 h without quote', color: 'var(--bad)', onClick: () => CRM.go('salespolicy') },
       { label: 'Site visit delays', value: b.filter((x) => x.type === 'Site Visit Delay').length, color: 'var(--warn)', onClick: () => CRM.go('salespolicy') },
       { label: 'Customer approved, SO pending', value: b.filter((x) => x.type === 'Customer Approval Pending SO').length, color: 'var(--chart-3)', onClick: () => CRM.go('salespolicy') },
@@ -2085,10 +2515,10 @@
     ]));
     el.appendChild(h('div', { class: 'grid g3' }, [
       h('div', { class: 'span2' }, card('Assignment queue', ui.table({ rows: unassigned, search: false, empty: 'All leads assigned', columns: [{ key: 'id', label: 'Enquiry', render: (e) => lnk('enquiries', e.id) }, { key: 'accountName', label: 'Account' }, { key: 'division', label: 'Division', render: (e) => ui.divTag(e.division) }, { key: 'area', label: 'Area' }, { key: 'salesChannel', label: 'Source' }, { key: 's', label: 'Suggested', render: (e) => (autoAssign(e.division, e.area).exec || {}).name }], actions: (e) => [ui.btn('Auto-assign', () => { const a = autoAssign(e.division, e.area); assignEnquiry(e, a.exec.id, a.rule); ui.toast('Assigned to ' + a.exec.name, 'ok'); CRM.refresh(); }, 'sm primary'), ui.btn('Choose', () => reassignModal(e), 'sm')] }), { flush: true, actions: [ui.btn('Assignment desk', () => CRM.go('enquiries'), 'sm')] })),
-      card('Quick actions', quick([['+ New enquiry', () => enquiryForm(), 'primary'], ['📅 Follow-up', () => followUpModal()], ['Pipeline', () => CRM.go('pipeline')], ['SLA monitor', () => CRM.go('salespolicy')], ['Reports', () => CRM.go('salesreports')], ['Targets', () => CRM.go('targets')]])),
+      card('Quick actions', quick([['+ New enquiry', () => enquiryForm(), 'primary'], ['📅 Follow-up', () => followUpModal()], ['Pipeline', () => CRM.go('pipeline')], ['SLA monitor', () => CRM.go('salespolicy')], ['Sales OTS desk', () => CRM.go('salesots')], ['Reports', () => CRM.go('salesreports')]])),
     ]));
     section(el, h('div', { class: 'grid g2' }, [
-      card('Escalations at coordinator level and above', b.filter((x) => x.level >= 2).length ? h('div', { class: 'stack', style: 'gap:6px' }, b.filter((x) => x.level >= 2).sort((a, c) => c.over - a.over).slice(0, 8).map((x) => h('a', { href: x.link, style: 'color:var(--text)' }, h('div', { class: 'row', style: 'justify-content:space-between;padding:6px 8px;border:1px solid var(--border);border-radius:8px' }, [h('div', {}, [h('b', {}, x.type), h('div', { class: 'small muted' }, x.details)]), ui.badge(LEVELS[x.level].label, x.level >= 3 ? 'bad' : 'warn')])))) : ui.empty('No escalations', '✅')),
+      card('Escalations at coordinator level and above', b.filter((x) => x.level >= 2).length ? h('div', { class: 'stack', style: 'gap:6px' }, b.filter((x) => x.level >= 2).sort((a, c) => c.over - a.over).slice(0, 8).map((x) => h('a', { href: x.links.find((l) => canOpen(l, CRM.role().id)) || '#/salespolicy', style: 'color:var(--text)' }, h('div', { class: 'row', style: 'justify-content:space-between;padding:6px 8px;border:1px solid var(--border);border-radius:8px' }, [h('div', {}, [h('b', {}, x.type), h('div', { class: 'small muted' }, x.details)]), ui.badge(LEVELS[x.level].label, x.level >= 3 ? 'bad' : 'warn')])))) : ui.empty('No escalations', '✅')),
       card("Team follow-ups today (completed vs planned)", ui.hbars(execs().map((s) => { const m = db.find('followups', (f) => f.execId === s.id && f.dueDate === todayIso()); return { label: s.name, value: m.filter((f) => f.status !== 'Planned').length, target: m.length }; }))),
     ]));
   });
@@ -2139,33 +2569,79 @@
   });
 
   // ============================================================ pages
-  CRM.registerPage({ id: 'salesdash', title: 'Sales Dashboard', icon: '📈', section: 'Sales', order: 10, roles: ROLES_MGMT_SALES, render: renderDashboard });
-  CRM.registerPage({ id: 'mobile', title: 'Mobile Sales', icon: '📱', section: 'Sales', order: 10.5, roles: ROLES_SALES, render: renderMobile });
-  CRM.registerPage({ id: 'enquiries', title: 'Leads & Enquiries', icon: '📥', section: 'Sales', order: 11, roles: ROLES_SALES, render: renderEnquiries, badge: () => (isCoord() ? db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage)).length : 0) });
-  CRM.registerPage({ id: 'pipeline', title: 'Pipeline', icon: '▦', section: 'Sales', order: 12, roles: ROLES_SALES, render: renderPipeline });
-  CRM.registerPage({ id: 'quotations', title: 'Quotations', icon: '📄', section: 'Sales', order: 13, roles: ROLES_SALES, render: renderQuotations, badge: () => (isMgr() ? db.find('quotations', (q) => q.approval === 'Awaiting Approval').length : 0) });
-  CRM.registerPage({ id: 'orders', title: 'Sales Orders', icon: '📦', section: 'Sales', order: 14, roles: ROLES_SALES, render: renderOrders, badge: () => (isMgr() ? db.find('orders', (o) => o.approval === 'Awaiting Approval').length : 0) });
-  CRM.registerPage({ id: 'followups', title: 'Follow-ups', icon: '📅', section: 'Sales', order: 15, roles: ROLES_SALES, render: renderFollowups, badge: () => allFu().filter((f) => f.status === 'Planned' && f.dueDate <= todayIso()).length });
-  CRM.registerPage({ id: 'calls', title: 'Calls & Cold Calling', icon: '☎', section: 'Sales', order: 16, roles: ROLES_SALES, render: renderCalls });
-  CRM.registerPage({ id: 'upsell', title: 'Upsell & Cross-sell', icon: '⤴', section: 'Sales', order: 17, roles: ROLES_SALES, render: renderUpsell });
-  CRM.registerPage({ id: 'dealers', title: 'Dealer Sales', icon: '🤝', section: 'Sales', order: 18, roles: ROLES_SALES, render: renderDealers });
-  CRM.registerPage({ id: 'targets', title: 'Targets', icon: '🎯', section: 'Sales', order: 19, roles: ROLES_SALES, render: renderTargets });
-  CRM.registerPage({ id: 'salesimport', title: 'Data Migration', icon: '⇪', section: 'Sales', order: 19.5, roles: ['sales_manager', 'admin'], render: renderImport });
-  CRM.registerPage({ id: 'invoices', title: 'Invoices', icon: '🧾', section: 'Finance', order: 20, roles: ROLES_FIN, render: renderInvoices, badge: () => (isAcc() ? db.all('orders').filter((o) => o.approval === 'Approved' && !o.migrated && !invoicesOf(o.id).length).length : 0) });
-  CRM.registerPage({ id: 'payments', title: 'Payments & Collections', icon: '₹', section: 'Finance', order: 21, roles: ROLES_FIN, render: renderPayments, badge: () => (isAcc() ? db.find('payments', (p) => !p.verified).length : 0) });
-  CRM.registerPage({ id: 'outstanding', title: 'Outstanding & Ageing', icon: '⏳', section: 'Finance', order: 22, roles: ROLES_FIN, render: renderOutstanding });
-  CRM.registerPage({ id: 'salesreports', title: 'Report Centre', icon: '📊', section: 'Sales Reports', order: 25, roles: ['sales_exec', 'sales_coordinator', 'sales_manager', 'gm', 'admin'], render: renderReports });
-  CRM.registerPage({ id: 'cycletimes', title: 'Cycle Times', icon: '⏱', section: 'Sales Reports', order: 26, roles: ROLES_MGMT_SALES, render: renderCycleTimes });
-  CRM.registerPage({ id: 'salespolicy', title: 'Sales SLA & Escalations', icon: '🚨', section: 'Sales Reports', order: 27, roles: ['sales_coordinator', 'sales_manager', 'gm', 'admin', 'odm'], render: renderPolicy });
+  const regPage = (p) => { PAGE_ROLES[p.id] = p.roles; CRM.registerPage(p); };
+  regPage({ id: 'salesdash', title: 'Sales Dashboard', icon: '📈', section: 'Sales', order: 10, roles: ROLES_MGMT_SALES, render: renderDashboard });
+  regPage({ id: 'mobile', title: 'Mobile Sales', icon: '📱', section: 'Sales', order: 10.5, roles: ROLES_SALES, render: renderMobile });
+  regPage({ id: 'enquiries', title: 'Leads & Enquiries', icon: '📥', section: 'Sales', order: 11, roles: ROLES_SALES, render: renderEnquiries, badge: () => (isCoord() ? db.find('enquiries', (e) => !e.execId && OPEN.includes(e.stage)).length : 0) });
+  regPage({ id: 'pipeline', title: 'Pipeline', icon: '▦', section: 'Sales', order: 12, roles: ROLES_SALES, render: renderPipeline });
+  regPage({ id: 'quotations', title: 'Quotations', icon: '📄', section: 'Sales', order: 13, roles: ROLES_SALES, render: renderQuotations, badge: () => (isMgr() ? db.find('quotations', (q) => q.approval === 'Awaiting Approval').length : 0) });
+  regPage({ id: 'orders', title: 'Sales Orders', icon: '📦', section: 'Sales', order: 14, roles: ROLES_SALES, render: renderOrders, badge: () => (isMgr() ? db.find('orders', (o) => o.approval === 'Awaiting Approval').length : 0) });
+  regPage({ id: 'followups', title: 'Follow-ups', icon: '📅', section: 'Sales', order: 15, roles: ROLES_SALES, render: renderFollowups, badge: () => allFu().filter((f) => f.status === 'Planned' && f.dueDate <= todayIso()).length });
+  regPage({ id: 'calls', title: 'Calls & Cold Calling', icon: '☎', section: 'Sales', order: 16, roles: ROLES_SALES, render: renderCalls });
+  regPage({ id: 'upsell', title: 'Upsell & Cross-sell', icon: '⤴', section: 'Sales', order: 17, roles: ROLES_SALES, render: renderUpsell });
+  regPage({ id: 'salesots', title: 'Sales OTS Desk', icon: '🔋', section: 'Sales', order: 17.5, roles: ROLES_SALES, render: renderSalesOts, badge: () => (isCoord() ? pendingOts().length : 0) });
+  regPage({ id: 'dealers', title: 'Dealer Sales', icon: '🤝', section: 'Sales', order: 18, roles: ROLES_SALES, render: renderDealers });
+  regPage({ id: 'targets', title: 'Targets', icon: '🎯', section: 'Sales', order: 19, roles: ROLES_SALES, render: renderTargets });
+  regPage({ id: 'salesimport', title: 'Data Migration', icon: '⇪', section: 'Sales', order: 19.5, roles: ['sales_manager', 'accounts', 'admin'], render: renderImport });
+  regPage({ id: 'invoices', title: 'Invoices', icon: '🧾', section: 'Finance', order: 20, roles: ROLES_FIN, render: renderInvoices, badge: () => (isAcc() ? db.all('orders').filter((o) => o.approval === 'Approved' && !o.migrated && !invoicesOf(o.id).length).length : 0) });
+  regPage({ id: 'payments', title: 'Payments & Collections', icon: '₹', section: 'Finance', order: 21, roles: ROLES_FIN, render: renderPayments, badge: () => (isAcc() ? db.find('payments', (p) => !p.verified).length : 0) });
+  regPage({ id: 'outstanding', title: 'Outstanding & Ageing', icon: '⏳', section: 'Finance', order: 22, roles: ROLES_FIN, render: renderOutstanding });
+  regPage({ id: 'salesreports', title: 'Report Centre', icon: '📊', section: 'Sales Reports', order: 25, roles: ['sales_exec', 'sales_coordinator', 'sales_manager', 'gm', 'admin'], render: renderReports });
+  regPage({ id: 'cycletimes', title: 'Cycle Times', icon: '⏱', section: 'Sales Reports', order: 26, roles: ROLES_MGMT_SALES, render: renderCycleTimes });
+  regPage({ id: 'salespolicy', title: 'Sales SLA & Escalations', icon: '🚨', section: 'Sales Reports', order: 27, roles: ['sales_coordinator', 'sales_manager', 'gm', 'admin', 'odm'], render: renderPolicy });
+
+  // ============================================================ admin: sales rules & report configuration (Settings & Rules)
+  function renderSalesSettings(container) {
+    const canEdit = CRM.is('sales_manager', 'admin');
+    const block = (title, key, fields, note, toSave) => {
+      const cur = cfg(key);
+      const f = ui.form(fields.map((x) => Object.assign({ type: 'number', min: 0, step: 'any', required: x.required !== false }, x)), cur);
+      if (!canEdit) Object.values(f.inputs).forEach((i) => { i.disabled = true; });
+      return card(title, h('div', { class: 'stack' }, [note ? h('div', { class: 'small muted' }, note) : null, f, canEdit ? h('div', {}, ui.btn('Save', () => {
+        if (!f.validate()) return;
+        const v = f.values();
+        const err = toSave ? toSave(v) : null;
+        if (err) { ui.toast(err, 'bad'); return; }
+        setCfg(key, Object.assign({}, cur, v)); ui.toast(title + ' saved', 'ok');
+      }, 'primary sm')) : null]));
+    };
+    const asc = (v) => (v.l2 < v.l3 && v.l3 < v.l4 ? null : 'Levels must increase: L2 < L3 < L4');
+    container.appendChild(h('div', { class: 'stack' }, [
+      canEdit ? null : calloutH('Read-only — the Sales Manager or CRM Administrator can change sales rules.', 'info'),
+      h('div', { class: 'grid g2' }, [
+        block('Sales policy SLAs', 'sales.sla', [{ key: 'quoteHrs', label: 'Quotation within (hours of enquiry)' }, { key: 'siteVisitHrs', label: 'Site visit within (hours)' }, { key: 'soHrs', label: 'SO issued within (hours of customer approval)' }, { key: 'scrapHrs', label: 'Scrap collected within (hours of installation)' }, { key: 'quoteResponseDays', label: 'Customer response reminder after (days)' }], 'Breaches are raised as policy violations and escalated automatically.'),
+        block('Escalation ladder (hours after breach)', 'sales.escalation', [{ key: 'l2', label: 'L2 · Sales Coordinator after (+h)' }, { key: 'l3', label: 'L3 · Sales Head after (+h)' }, { key: 'l4', label: 'L4 · Management (GM / ODM) after (+h)' }], 'Policy default: breach → executive, +6 h coordinator, +12 h department head, +24 h management.', asc),
+        block('Payment collection escalation (days overdue)', 'sales.paymentEscalation', [{ key: 'l2', label: 'L2 · Sales Coordinator after (days)' }, { key: 'l3', label: 'L3 · Sales Head after (days)' }, { key: 'l4', label: 'L4 · Management after (days)' }], 'Day 1 past the credit period → executive + Accounts.', asc),
+        block('Reminders & alerts', 'sales.reminders', [{ key: 'paymentDueDays', label: 'Payment-due reminder window (days before due)' }, { key: 'scanMinutes', label: 'Re-check reminders & escalations every (minutes)', min: 1 }], 'Follow-up due / missed reminders go to the owning executive; the coordinator gets a team digest.'),
+        block('Quotation rules', 'sales.discount', [{ key: 'justifyAbovePct', label: 'Discount above which justification is mandatory (%)' }]),
+        block('Sales OTS incentive', 'sales.otsIncentive', [{ key: 'salesPct', label: 'Sales OTS incentive % of order value (blank = Service setting)', required: false }, { key: 'engineerSharePct', label: 'Shared case: engineer share % (executive gets the rest)', max: 100 }], 'Applied on the Sales OTS desk to orders booked from Service opportunities.', (v) => (v.engineerSharePct > 100 ? 'Engineer share cannot exceed 100%' : null)),
+      ]),
+      card('GST rate by division (used on quotations and default invoice values)', ui.dl(DIVS.map((d) => [d, gstPct(d) + '%' + (CRM.config ? ' · config key gst.' + d : ' · default')]))),
+      card('Reports', ui.dl([['Daily reports', '10 · default range today'], ['Weekly reports', '2 · calendar week Monday → Sunday'], ['Monthly reports', '7 · month to date'], ['Exports', 'CSV and PDF on every report'], ['Executives', 'own data only; division-wise reports hidden']])),
+    ]));
+  }
+  if (CRM.registerConfigSection) CRM.registerConfigSection({ id: 'sales-rules', title: 'Sales rules & reports', roles: ['sales_manager', 'admin', 'gm'], render: renderSalesSettings });
+  else regPage({ id: 'salessettings', title: 'Sales Settings', icon: '⚙', section: 'Sales Reports', order: 28, roles: ['sales_manager', 'admin', 'gm'], render: (el) => { ui.page(el, { title: 'Sales Settings', sub: 'Sales SLAs, escalation ladder, reminder windows, quotation and incentive rules' }); renderSalesSettings(el); } });
 
   // ============================================================ customer 360, global search
+  // Data scope per role: sales roles see the pipeline (executives only their own); Accounts sees invoices & payments only;
+  // other departments see the customer's sale orders (what was bought) without pipeline or receivables
   CRM.registerCustomerSection((c) => {
-    const enqs = scope(db.find('enquiries', (e) => e.customerId === c.id)), ords = scope(db.find('orders', (o) => o.customerId === c.id)), invs = scope(db.find('invoices', (i) => i.customerId === c.id));
+    const salesRole = CRM.is(...ROLES_SALES), finRole = CRM.is('accounts');
+    const enqs = scope(db.find('enquiries', (e) => e.customerId === c.id)), ords = scope(db.find('orders', (o) => o.customerId === c.id && o.approval !== 'Rejected')), invs = scope(db.find('invoices', (i) => i.customerId === c.id));
     const os = sum(invs, outstandingOf);
+    if (finRole && !salesRole) {
+      return { title: 'Accounts — invoices & payments', flush: true, summary: invs.length + ' invoices · O/S ' + fmt.lakh(os),
+        body: () => h('div', {}, [ui.kpis([{ label: 'Invoiced', value: fmt.lakh(sum(invs, 'value')) }, { label: 'Received', value: fmt.lakh(sum(invs, paidOf)), color: 'var(--ok)' }, { label: 'Outstanding', value: fmt.lakh(os), color: 'var(--bad)' }, { label: 'Awaiting verification', value: fmt.lakh(sum(invs, pendingOf)), color: 'var(--chart-4)' }]), invoiceTable(invs, { search: false })]) };
+    }
+    if (!salesRole) {
+      const live = ords.filter((o) => o.approval === 'Approved');
+      return { title: 'Sales orders', flush: true, summary: live.length + ' approved sale orders', body: () => ui.table({ rows: live, search: false, pageSize: 6, empty: 'No sale orders', columns: [{ key: 'soNumber', label: 'SO', render: (o) => mono(o.soNumber) }, { key: 'wonDate', label: 'Date', render: (o) => fmt.date(o.wonDate) }, { key: 'division', label: 'Division', render: (o) => ui.divTag(o.division) }, { key: 'product', label: 'Product', render: (o) => o.product + ' × ' + o.quantity }, { key: 'installationStatus', label: 'Installation', render: (o) => ui.badge(o.installationStatus) }, { key: 'warrantyContract', label: 'Warranty' }] }) };
+    }
     return {
       title: 'Sales — enquiries, orders & outstanding', flush: true,
       summary: enqs.length + ' enquiries · ' + ords.length + ' orders · O/S ' + fmt.lakh(os),
-      body: () => ui.tabs([{ id: 'e', label: 'Enquiries', count: enqs.length }, { id: 'o', label: 'Orders', count: ords.length }, { id: 'i', label: 'Outstanding', count: invs.filter((i) => outstandingOf(i) > 0).length }, { id: 'u', label: 'Upsell', count: db.find('upsells', (u) => u.customerId === c.id).length }], (id, body) => {
+      body: () => ui.tabs([{ id: 'e', label: 'Enquiries', count: enqs.length }, { id: 'o', label: 'Orders', count: ords.length }, { id: 'i', label: 'Outstanding', count: invs.filter((i) => outstandingOf(i) > 0).length }, { id: 'u', label: 'Upsell', count: scope(db.find('upsells', (u) => u.customerId === c.id)).length }], (id, body) => {
         if (id === 'e') body.appendChild(enquiryTable(enqs, { pageSize: 6 }));
         if (id === 'o') body.appendChild(orderTable(ords));
         if (id === 'i') body.appendChild(h('div', {}, [ui.kpis([{ label: 'Invoiced', value: fmt.lakh(sum(invs, 'value')) }, { label: 'Received', value: fmt.lakh(sum(invs, paidOf)), color: 'var(--ok)' }, { label: 'Outstanding', value: fmt.lakh(os), color: 'var(--bad)' }]), invoiceTable(invs, { search: false })]));
@@ -2186,7 +2662,18 @@
   // ============================================================ events & automations
   const SALES_COLS = ['enquiries', 'quotations', 'orders', 'invoices', 'payments', 'followups'];
   const scheduleScan = util.debounce(runPolicyScan, 400);
-  CRM.on('ready', () => { try { runPolicyScan(); } catch (e) { console.error('[sales] policy scan', e); } });
+  CRM.on('ready', () => {
+    try { promoteExistingBuyers(); } catch (e) { console.error('[sales] customer promotion', e); }
+    try { runPolicyScan(); } catch (e) { console.error('[sales] policy scan', e); }
+  });
+  // reminders and escalations are re-checked on a timer too (not only when data changes)
+  const tick = () => { try { runPolicyScan(); } catch (e) { console.error('[sales] policy scan', e); } };
+  const tickMs = Math.max(1, Number(cfg('sales.reminders').scanMinutes) || 5) * 60e3;
+  if (CRM.registerTick) CRM.registerTick(tick, tickMs); else setInterval(tick, tickMs);
+  /** One-time data fix for stores created before promotion existed: customers with an approved order are no longer "New". */
+  function promoteExistingBuyers() {
+    master.customers().filter((c) => c.type === 'New Customer' && db.one('orders', (o) => o.customerId === c.id && o.approval === 'Approved')).forEach((c) => promoteCustomer(c.id));
+  }
   CRM.on('db:change', (x) => { if (x && SALES_COLS.includes(x.col)) scheduleScan(); });
   // Service raised a chargeable complaint → service-charge invoice for Accounts to collect
   CRM.on('complaint.chargeable', (p) => {
@@ -2195,15 +2682,18 @@
     const cust = master.customer(c.customerId) || {};
     const inv = db.insert('invoices', { invoiceNo: 'MPCS/' + fy(new Date()) + '/SRV-' + CRM.nextId('INVNO').split('-')[1], orderId: '', complaintId: c.id || '', soNumber: '', customerId: c.customerId || '', accountName: cust.name || c.customerName || 'Service customer', division: c.division || 'Power', execId: '', invoiceDate: todayIso(), value: Math.round(p.amount), paymentTerms: 'Credit 15 days', dueDate: util.iso(util.addDays(CRM.TODAY, 15)), hardCopySubmitted: false, invoiceMailed: false, confirmedWith: cust.contact || '', source: 'Service' }, { prefix: 'INV', note: 'Service charges from complaint ' + (c.id || '') });
     CRM.emit('invoice.raised', { invoice: inv });
-    CRM.notify({ to: ['accounts'], title: 'Service charges to collect: ' + fmt.money(p.amount), body: (cust.name || '') + ' · complaint ' + (c.id || ''), link: '#/invoices', severity: 'info', key: 'srvinv:' + (c.id || inv.id) });
+    send(['accounts'], { title: 'Service charges to collect: ' + fmt.money(p.amount), body: (cust.name || '') + ' · complaint ' + (c.id || ''), link: '#/invoices', severity: 'info', key: 'srvinv:' + (c.id || inv.id) });
   });
   // Sales OTS (battery qty > 2) from Service → Sales Coordinator assigns to an executive
+  // Payload: { ots } with service.js field names (qty, value, brand, productType, capacity, contact, customerId, urgency, complaintId)
   CRM.on('ots.created', (p) => {
     const o = (p && (p.ots || p)) || {};
-    if (!/sales/i.test(String(o.otsType || o.type || o.department || ''))) return;
-    CRM.notify({ to: ['sales_coordinator'], title: 'Sales OTS ' + (o.id || '') + ' awaiting assignment', body: (o.customerName || '') + ' · battery qty ' + (o.batteryQty || '?'), link: '#/enquiries', severity: 'warn', key: 'ots:' + o.id });
+    if (!o.id || !isSalesOts(o)) return;
+    const c = otsCustomer(o);
+    // Service already alerts the coordinator for this OTS (key 'ots-<id>') — only notify when it did not
+    setTimeout(() => { if (db.one('notifications', (x) => x.key === 'ots-' + o.id)) return; send(['sales_coordinator'], { title: 'Sales OTS ' + o.id + ' — assign to a Sales Executive', body: (c.name || o.customerName || 'Customer') + ' · ' + otsQty(o) + ' × ' + (o.productType || 'Battery') + (o.brand ? ' ' + o.brand : '') + ' · est. ' + fmt.money(otsValue(o)) + (o.urgency ? ' · ' + o.urgency : ''), severity: 'warn', key: 'ots:' + o.id }, ['#/ots/' + o.id, '#/salesots/' + o.id]); }, 0);
   });
 
   // ============================================================ public helper (GM cockpit)
-  CRM.sales = { summary, autoAssign, policyBreaches, outstandingOf, targetFor, achievedFor };
+  CRM.sales = { summary, autoAssign, policyBreaches, outstandingOf, targetFor, achievedFor, acquisitions, gstPct, otsIncentive: (id) => { const o = db.get('ots', id); return o ? otsIncentive(o) : null; } };
 })();
