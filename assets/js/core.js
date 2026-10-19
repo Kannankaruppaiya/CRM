@@ -92,10 +92,13 @@
     if (!state || !state.__v) state = { __v: 1, __counters: {} };
     Object.assign(counters, state.__counters || {});
   }
-  const persist = util.debounce(() => {
+  function persistNow() {
+    if (!state) return;
     state.__counters = counters;
     try { localStorage.setItem(STORE_KEY, JSON.stringify(state)); } catch (e) { console.warn('[CRM] storage full', e); }
-  }, 150);
+  }
+  const persist = util.debounce(persistNow, 150);
+  window.addEventListener('pagehide', persistNow);
 
   function nextId(prefix, width) {
     counters[prefix] = (counters[prefix] || 0) + 1;
