@@ -117,7 +117,7 @@
     solar: [['so', 'SO receipt'], ['survey', 'Site visit & feasibility'], ['boq', 'BOQ'], ['procurement', 'Purchase & material planning'], ['delivery', 'Dispatch & site verification'], ['planning', 'Installation planning'], ['civil', 'Civil work'], ['mechanical', 'Mechanical installation'], ['electrical', 'Electrical installation'], ['commissioning', 'Testing & commissioning'], ['compliance', 'Net metering & subsidy'], ['demo', 'Customer demonstration'], ['handover', 'Customer handover']],
     es_pending: [['so', 'SO receipt / classification']],
   };
-  const DUR = { so: 1, scope: 1, survey: 5, boq: 3, procurement: 9, delivery: 3, planning: 2, cable: 6, nvr: 2, cameras: 5, install: 3, testing: 3, handover: 4, activate: 2, civil: 5, mechanical: 4, electrical: 4, commissioning: 3, compliance: 10, demo: 1 };
+  const DUR = { so: 1, scope: 1, survey: 5, boq: 3, procurement: 9, delivery: 3, planning: 2, cable: 6, nvr: 2, cameras: 5, positioning: 2, install: 3, testing: 3, handover: 4, activate: 2, civil: 5, mechanical: 4, electrical: 4, commissioning: 3, compliance: 10, demo: 1 };
   const DUR_SMALL = { so: 1, scope: 1, survey: 2, boq: 2, procurement: 4, delivery: 2, install: 3, testing: 1, handover: 1, activate: 2 };
   const durOf = (p) => { const c = cfg('projects.stageDays', {}) || {}; return p.kind === 'es_small' ? Object.assign({}, DUR_SMALL, c.small || {}) : Object.assign({}, DUR, c[p.kind === 'solar' ? 'solar' : 'large'] || {}); };
   const CRITICAL_DEFAULT = ['procurement', 'delivery', 'testing', 'commissioning', 'handover'];
@@ -176,6 +176,12 @@
       owner: 'Installation Team', roles: ['install_lead', 'tech_engineer', 'es_coordinator'], special: 'devices', task: true,
       checklist: ['Camera make, model and serial number recorded where applicable', 'Installation location and camera ID recorded', 'Camera mounting completed', 'Field of view checked', 'Image quality and focus verified', 'Night vision / IR checked where applicable', 'Day/night image quality checked as appropriate', 'Camera connection and power verified', 'Network connectivity verified for IP systems', 'Video feed mapped to the correct DVR/NVR channel', 'Camera view confirmed with customer where required', 'Final installation photographs uploaded', 'Defects and corrective actions recorded'],
       gate: (p) => devicesGate(p),
+    },
+    positioning: {
+      owner: 'Installation Team / Technical Engineer', roles: ['install_lead', 'tech_engineer', 'es_coordinator'], task: true,
+      checklist: ['Each camera aimed at its approved field of view', 'Lens zoom and focus set per camera', 'Mounting angle locked and weather-sealed', 'Day and night view verified from the recorder', 'Blind spots resolved or formally accepted by the customer', 'Positioning photographs captured'],
+      fields: [F('aligned', 'Cameras positioned & aligned (count)', 'number'), F('approvedBy', 'Views approved by (customer / engineer)'), F('blindSpots', 'Accepted blind spots / remarks', 'textarea', { required: false })],
+      gate: (p) => { const n = Number(st(p, 'positioning').fields.aligned) || 0; const need = Number(p.cameraCount) || (p.devices || []).filter((d) => d.type === 'Camera').length; return n < need ? 'Only ' + n + ' of ' + need + ' cameras are positioned & aligned.' : null; },
     },
     install: {
       owner: 'Installation Team / Technical Engineer', roles: ['install_lead', 'tech_engineer', 'es_coordinator'], special: 'devices', task: true,
@@ -304,7 +310,7 @@
     const base = LIB[key] || {};
     const ov = p.kind === 'solar' ? LIB_SOLAR[key] : p.kind === 'es_small' ? LIB_SMALL[key] : null;
     const d = Object.assign({ key, label: key }, base, ov || {});
-    d.label = ((WF[p.kind] || []).find((x) => x[0] === key) || [key, d.label])[1];
+    d.label = ((WF[p.kind] || []).concat([POS_STAGE]).find((x) => x[0] === key) || [key, d.label])[1];
     if (p.kind === 'solar' && d.special === 'devices' && key !== 'commissioning') d.special = null;
     // management-approved checklist versions (Settings & Rules) replace the built-in lists
     const co = (cfg('projects.checklists', {}) || {})[p.kind + '.' + key];
@@ -315,7 +321,10 @@
   const doneCount = (s, list) => (s.done || []).filter((i) => i < (list || []).length).length;
   const DONE = (s) => !!s && (s.status === 'Completed' || s.status === 'Skipped');
   function st(p, key) { p.stages = p.stages || {}; return p.stages[key] || (p.stages[key] = { status: 'Not Started', done: [], fields: {} }); }
-  const workflow = (p) => { const wf = WF[p.kind] || []; const sp = sysProfile(p); return sp ? wf.map(([k, l]) => [k, k === 'nvr' ? sp.cfgLabel : k === 'cameras' ? sp.devLabel : k === 'testing' && p.kind === 'es_small' ? 'Configuration & testing' : l]) : wf; };
+  // ES large CCTV projects created with 'projects.positioningStage' on (default) get Positioning & Alignment as its own stage after camera installation
+  const POS_STAGE = ['positioning', 'Positioning & alignment'];
+  const withPositioning = (wf) => { const i = wf.findIndex(([k]) => k === 'cameras'); return i < 0 ? wf : wf.slice(0, i + 1).concat([POS_STAGE], wf.slice(i + 1)); };
+  const workflow = (p) => { const wf0 = WF[p.kind] || []; const sp = sysProfile(p); const wf = p.kind === 'es_large' && p.positioningStage && !sp ? withPositioning(wf0) : wf0; return sp ? wf.map(([k, l]) => [k, k === 'nvr' ? sp.cfgLabel : k === 'cameras' ? sp.devLabel : k === 'testing' && p.kind === 'es_small' ? 'Configuration & testing' : l]) : wf; };
   function curIndex(p) { const wf = workflow(p); const i = wf.findIndex(([k]) => !DONE((p.stages || {})[k])); return i < 0 ? wf.length : i; }
   const curKey = (p) => (workflow(p)[curIndex(p)] || [null])[0];
   const curLabel = (p) => (p.status === 'Closed' ? 'Closed' : (workflow(p)[curIndex(p)] || [null, 'Completed'])[1]);
@@ -598,6 +607,7 @@
     return rec;
   }
   function planDues(p, at) {
+    if (p.kind === 'es_large' && p.positioningStage == null) p.positioningStage = cfg('projects.positioningStage', true) !== false;
     let t = new Date(at);
     const dur = durOf(p);
     const scale = p.kind === 'es_large' ? (p.cameraCount > 48 ? 1.4 : 1.15) : p.kind === 'solar' && p.capacityKw > 20 ? 1.4 : 1;
@@ -1319,6 +1329,17 @@
       applyKind(q, kind, v.reason);
     });
   }
+  // approved installation vendors (wiring / installation contractors): config 'projects.installVendors' = { staffId: { approved, divisions[], validTo } }
+  // Not configured yet → every active vendor user counts as approved (demo default); once saved, only listed, unexpired vendors may be assigned.
+  function installVendorList() { return cfg('projects.installVendors', null); }
+  function vendorApproved(id, division) {
+    if (!id) return false;
+    const st = db.get('staff', id); if (!st || st.role !== 'vendor' || st.active === false) return false;
+    const list = installVendorList(); if (!list) return true;
+    const e = list[id]; if (!e || !e.approved) return false;
+    if (e.divisions && e.divisions.length && division && !e.divisions.includes(division)) return false;
+    return !e.validTo || e.validTo >= isoD(T0);
+  }
   function staffOpts(roles) { return [].concat(roles).flatMap((r) => master.staff(r)).map((s) => ({ value: s.id, label: s.name + (s.division ? ' (' + s.division + ')' : '') })); }
   // §7 St3 skillset verification for project engineers (skills configurable in Settings & Rules)
   const ES_SKILLS = ['CCTV', 'Access Control', 'Biometric', 'Video Door Phone', 'Display System'];
@@ -1337,7 +1358,7 @@
       { key: 'skillOverride', label: 'Skill exception reason (only if the engineer lacks the required skill)', hint: 'Required skill: ' + requiredSkill(p) },
       { key: 'installLead', label: 'Installation team leader', type: 'select', options: staffOpts('install_lead') },
       { key: 'installMode', label: 'Installation mode', type: 'select', required: true, options: INSTALL_MODES },
-      { key: 'vendorId', label: 'Vendor (if Vendor / Mixed)', type: 'select', options: staffOpts('vendor') },
+      { key: 'vendorId', label: 'Approved installation vendor (if Vendor / Mixed)', type: 'select', options: staffOpts('vendor').filter((o) => vendorApproved(o.value, p.division) || o.value === p.vendorId).map((o) => Object.assign({}, o, { label: o.label + (vendorApproved(o.value, p.division) ? '' : ' — NOT APPROVED') })), hint: 'Only vendors on the approved installation-contractor list (Settings & Rules) can be assigned' },
       { key: 'priority', label: 'Priority', type: 'select', required: true, options: PRIORITIES },
       { key: 'committedDate', label: 'Committed completion date (original — frozen once set)', type: p.committedDate ? 'readonly' : 'date', required: true },
       { key: 'revisedDate', label: 'Approved revised date', type: 'date' },
@@ -1348,6 +1369,7 @@
     const u = p.utility || {};
     ui.formModal('Project setup — ' + p.id, fields, Object.assign({}, p, { revisionReason: '', skillOverride: '', u_discom: u.discom, u_consumerNo: u.consumerNo, u_sanctionedLoad: u.sanctionedLoad, u_tariff: u.tariff, u_meterType: u.meterType }), (v) => {
       if (v.installMode !== 'Own team' && !v.vendorId) { ui.toast('Select the vendor for Vendor / Mixed installation mode', 'bad'); return false; }
+      if (v.installMode !== 'Own team' && !vendorApproved(v.vendorId, p.division)) { ui.toast('Blocked: ' + sName(v.vendorId) + ' is not on the approved installation-vendor list for ' + p.division + ' (or the approval has expired)', 'bad'); return false; }
       if (v.soNumber) { const dup = db.one('projects', (x) => x.id !== p.id && x.soNumber === v.soNumber.trim() && x.status !== 'Cancelled'); if (dup) { ui.toast('Duplicate prevented — ' + dup.id + ' already uses ' + v.soNumber, 'bad'); return false; } }
       const skillOk = engineerSkills(v.engineer).includes(requiredSkill(p));
       if (v.engineer && v.engineer !== p.engineer && !skillOk && !yes(v.skillOverride)) { ui.toast(sName(v.engineer) + ' does not have the ' + requiredSkill(p) + ' skill — choose another engineer or record a skill exception reason', 'bad'); return false; }
@@ -2068,7 +2090,7 @@
     return ui.lineChart(ms.map((m) => m.label), [{ name: 'Planned completions (committed)', color: 'var(--chart-4)', values: ms.map((m) => ps.filter((p) => inMonth(p.committedDate, m)).length), dashed: true }, { name: 'Actual completions', color: 'var(--chart-2)', values: ms.map((m) => ps.filter((p) => p.status === 'Closed' && inMonth(p.closedAt, m)).length) }]);
   }
   function stageBars(ps, kind) {
-    const wf = WF[kind];
+    const wf = kind === 'es_large' ? withPositioning(WF[kind]) : WF[kind];
     return ui.barChart(wf.map(([k, l]) => ({ label: l.split(' ')[0] + (l.split(' ')[1] ? ' ' + l.split(' ')[1] : ''), values: [ps.filter((p) => p.kind === kind && isActive(p) && curKey(p) === k).length] })), [{ name: 'Projects', color: kind === 'solar' ? 'var(--div-solar)' : kind === 'es_small' ? 'var(--chart-6)' : 'var(--div-security)' }], { height: 200 });
   }
   function vendorPerf(ps) {
@@ -2719,6 +2741,20 @@
     el.appendChild(ui.kpis([{ label: 'Total scrap collected', value: sumBy(rows.filter((s) => s.status !== 'Pending Collection'), 'qty') }, { label: 'Pending collection', value: rows.filter((s) => s.status === 'Pending Collection').length, meta: rows.filter((s) => s.late).length + ' beyond 24h', color: 'var(--bad)' }, { label: 'Scrap in stock', value: sumBy(rows.filter((s) => ['Collected', 'In Stock'].includes(s.status)), 'qty'), color: 'var(--warn)' }, { label: 'Sent to vendor', value: sumBy(rows.filter((s) => s.status === 'Sent to Vendor'), 'qty'), color: 'var(--chart-5)' }, { label: 'Disposed', value: sumBy(rows.filter((s) => s.status === 'Disposed'), 'qty'), color: 'var(--ok)' }, { label: 'Disposal approvals pending', value: rows.filter((s) => s.disposalReq && !s.disposalReq.approvedBy).length, color: 'var(--chart-4)' }]));
     const byType = util.groupBy(rows, 'scrapType');
     el.appendChild(h('div', { class: 'grid g3' }, [h('div', { class: 'span2' }, ui.card(null, ui.table({ rows, filters: [{ key: 'status', label: 'statuses', options: SCRAP_STATUS }, { key: 'scrapType', label: 'types', options: Object.keys(byType) }, { key: 'source', label: 'sources', options: ['From Service', 'From Installation', 'From Replacement'] }], onRow: (s) => scrapDrawer(s.id), columns: [{ key: 'id', label: 'Scrap ID', render: (s) => mono(s.id) }, { key: 'link', label: 'Linked', render: (s) => s.linkType + ' ' + (s.linkId || '') }, { key: 'customerId', label: 'Customer', render: (s) => cust(s.customerId).name }, { key: 'scrapType', label: 'Type' }, { key: 'brand', label: 'Brand' }, { key: 'qty', label: 'Qty', cls: 'right' }, { key: 'source', label: 'Source' }, { key: 'storedAt', label: 'Stored at' }, { key: 'status', label: 'Status', render: (s) => h('span', {}, [ui.badge(s.status), s.late ? ' ' : '', s.late ? ui.badge(s.late, 'bad') : '']) }] }), { flush: true })), ui.card('Scrap by type', ui.donut(Object.keys(byType).map((k, i) => ({ label: k, value: sumBy(byType[k], 'qty'), color: 'var(--chart-' + ((i % 6) + 1) + ')' })), { label: 'units' }))]));
+    // scrap reports: collection register, scrap stock (on hand), vendor returns — each exportable to CSV
+    const scCols = [{ label: 'Scrap ID', key: 'id' }, { label: 'Created', csv: (s) => s.createdAt }, { label: 'Trigger', key: 'trigger' }, { label: 'Linked', csv: (s) => s.linkType + ' ' + (s.linkId || '') }, { label: 'Complaint', key: 'complaintId' }, { label: 'OTS', key: 'otsId' }, { label: 'GRN', key: 'grnId' }, { label: 'Customer', csv: (s) => cust(s.customerId).name }, { label: 'Type', key: 'scrapType' }, { label: 'Brand', key: 'brand' }, { label: 'Capacity', key: 'capacity' }, { label: 'Qty', key: 'qty' }, { label: 'Source', key: 'source' }, { label: 'Collected by', csv: (s) => sName(s.collectedBy) }, { label: 'Stored at', key: 'storedAt' }, { label: 'Status', key: 'status' }, { label: 'Disposal / return mode', csv: (s) => (s.disposalReq || {}).mode || '' }, { label: 'Approved by', csv: (s) => (s.disposalReq || {}).approvedBy || '' }];
+    const onHand = rows.filter((s) => ['Collected', 'In Stock'].includes(s.status)); const toVendor = rows.filter((s) => s.status === 'Sent to Vendor' || /^Vendor/.test((s.disposalReq || {}).mode || ''));
+    el.appendChild(ui.card('Scrap reports', ui.tabs([{ id: 'col', label: 'Collection register', count: rows.length }, { id: 'stk', label: 'Scrap stock', count: onHand.length }, { id: 'ven', label: 'Vendor returns', count: toVendor.length }], (t, b) => {
+      if (t === 'col') { b.appendChild(h('div', { class: 'row' }, [exportBtn('scrap-collection', scCols, () => rows)])); b.appendChild(ui.table({ search: false, rows, pageSize: 10, onRow: (s) => scrapDrawer(s.id), columns: [{ key: 'id', label: 'Scrap', render: (s) => mono(s.id) }, { key: 'createdAt', label: 'Date', render: (s) => fmt.date(s.createdAt) }, { key: 'source', label: 'Source' }, { key: 'scrapType', label: 'Type' }, { key: 'qty', label: 'Qty', cls: 'right' }, { key: 'collectedBy', label: 'Collected by', render: (s) => sName(s.collectedBy) }, { key: 'status', label: 'Status', render: (s) => ui.badge(s.status) }] })); return; }
+      if (t === 'stk') {
+        const groups = {}; onHand.forEach((s) => { const k = [s.scrapType, s.brand || '—', s.capacity || '—', s.storedAt || '—'].join('|'); groups[k] = (groups[k] || 0) + (Number(s.qty) || 0); });
+        const stock = Object.keys(groups).map((k) => { const [type, brand, capacity, storedAt] = k.split('|'); return { type, brand, capacity, storedAt, qty: groups[k] }; });
+        b.appendChild(h('div', { class: 'row' }, [exportBtn('scrap-stock', [{ label: 'Type', key: 'type' }, { label: 'Brand', key: 'brand' }, { label: 'Capacity', key: 'capacity' }, { label: 'Stored at', key: 'storedAt' }, { label: 'Qty on hand', key: 'qty' }], () => stock)]));
+        b.appendChild(ui.table({ search: false, rows: stock, empty: 'No scrap on hand', columns: [{ key: 'type', label: 'Type' }, { key: 'brand', label: 'Brand' }, { key: 'capacity', label: 'Capacity' }, { key: 'storedAt', label: 'Stored at' }, { key: 'qty', label: 'Qty on hand', cls: 'right' }] })); return;
+      }
+      b.appendChild(h('div', { class: 'row' }, [exportBtn('scrap-vendor-returns', scCols, () => toVendor)]));
+      b.appendChild(ui.table({ search: false, rows: toVendor, empty: 'No vendor returns', onRow: (s) => scrapDrawer(s.id), columns: [{ key: 'id', label: 'Scrap', render: (s) => mono(s.id) }, { key: 'brand', label: 'Vendor / brand' }, { key: 'scrapType', label: 'Type' }, { key: 'qty', label: 'Qty', cls: 'right' }, { key: 'mode', label: 'Mode', render: (s) => (s.disposalReq || {}).mode || '—' }, { key: 'appr', label: 'Approved', render: (s) => ((s.disposalReq || {}).approvedBy ? (s.disposalReq.approvedBy + ' · ' + fmt.date(s.disposalReq.approvedAt)) : 'Pending approval') }, { key: 'status', label: 'Status', render: (s) => ui.badge(s.status) }] }));
+    }), { flush: false }));
   }
   function scrapForm() {
     ui.formModal('Scrap entry', [
@@ -3259,7 +3295,7 @@
   function cfgSlaRender(c) {
     const sd = cfg('projects.stageDays', {}) || {}; const esc = escCfg();
     const keys = Array.from(new Set(Object.keys(DUR).concat(Object.keys(DUR_SMALL))));
-    const tbl = h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, ['Stage', 'Large ES (days)', 'Small ES (days)', 'Solar (days)', 'Critical'].map((x) => h('th', {}, x)))), h('tbody', {}, keys.map((k) => h('tr', {}, [h('td', {}, (LIB[k] && WF.es_large.concat(WF.solar, WF.es_small).find((x) => x[0] === k) || [k, k])[1]), h('td', {}, h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'large', value: (sd.large || {})[k] || DUR[k] || '', style: 'width:70px', 'aria-label': k + ' large days' })), h('td', {}, DUR_SMALL[k] != null ? h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'small', value: (sd.small || {})[k] || DUR_SMALL[k], style: 'width:70px', 'aria-label': k + ' small days' }) : '—'), h('td', {}, h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'solar', value: (sd.solar || {})[k] || DUR[k] || '', style: 'width:70px', 'aria-label': k + ' solar days' })), h('td', {}, h('input', { type: 'checkbox', 'data-crit': k, checked: isCritical(k) ? true : null, 'aria-label': k + ' critical' }))])))]);
+    const tbl = h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, ['Stage', 'Large ES (days)', 'Small ES (days)', 'Solar (days)', 'Critical'].map((x) => h('th', {}, x)))), h('tbody', {}, keys.map((k) => h('tr', {}, [h('td', {}, (LIB[k] && WF.es_large.concat(WF.solar, WF.es_small, [POS_STAGE]).find((x) => x[0] === k) || [k, k])[1]), h('td', {}, h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'large', value: (sd.large || {})[k] || DUR[k] || '', style: 'width:70px', 'aria-label': k + ' large days' })), h('td', {}, DUR_SMALL[k] != null ? h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'small', value: (sd.small || {})[k] || DUR_SMALL[k], style: 'width:70px', 'aria-label': k + ' small days' }) : '—'), h('td', {}, h('input', { type: 'number', min: 1, 'data-k': k, 'data-w': 'solar', value: (sd.solar || {})[k] || DUR[k] || '', style: 'width:70px', 'aria-label': k + ' solar days' })), h('td', {}, h('input', { type: 'checkbox', 'data-crit': k, checked: isCritical(k) ? true : null, 'aria-label': k + ' critical' }))])))]);
     const f = ui.form([{ key: 'accept', label: 'Project acceptance / assignment SLA (days)', type: 'number' }, { key: 'prInit', label: 'PR initiation SLA after BOQ approval (days)', type: 'number' }, { key: 'atRiskDays', label: 'At-risk window before stage due (days)', type: 'number' }, { key: 'atRiskProgress', label: 'At-risk if progress below (%)', type: 'number' }, { key: 'violationAfterDays', label: 'Violation if overdue without reason after (days)', type: 'number' }].concat((esc.levels || ESC_DEFAULT.levels).flatMap((l, i) => [{ key: 'd' + i, label: l.level + ' — escalate after (days overdue)', type: 'number' }, { key: 'r' + i, label: l.level + ' — recipients (owner, coordinator or role ids, comma separated)' }])), Object.assign({ accept: cfg('projects.acceptSlaDays', 1), prInit: cfg('projects.prInitDays', 2), atRiskDays: esc.atRiskDays, atRiskProgress: esc.atRiskProgress, violationAfterDays: esc.violationAfterDays }, ...(esc.levels || []).map((l, i) => ({ ['d' + i]: l.afterDays, ['r' + i]: [].concat(l.roles || []).join(', ') }))));
     c.appendChild(h('div', { class: 'stack' }, [callout('Milestone SLA targets drive planned due dates of new projects (existing projects keep their committed plan). Escalation runs L1 task owner → L2 coordinator → L3 ODM → L4 GM / CEO by default.', 'info'), h('div', { class: 'table-wrap' }, tbl), f, saveBtn('Save SLAs & escalation', () => {
       const v = f.values(); const nums = Object.values(v).filter((x) => typeof x === 'number');
@@ -3313,7 +3349,19 @@
       setCfg('projects.closure', { operational: ops, administrative: adm }); setCfg('projects.warranty', w); setCfg('projects.engineerSkills', sk);
     })]));
   }
+  function cfgVendorRender(c) {
+    const cur = installVendorList() || {};
+    const vendors = db.all('staff').filter((x) => x.role === 'vendor');
+    const rows = vendors.map((v) => { const e = cur[v.id] || (installVendorList() ? { approved: false } : { approved: true, divisions: [ESD, SOL] }); return h('tr', {}, [h('td', {}, v.name + (v.division ? ' (' + v.division + ')' : '')), h('td', {}, h('input', { type: 'checkbox', 'data-v': v.id, 'data-f': 'approved', checked: e.approved ? true : null, 'aria-label': v.name + ' approved' })), h('td', {}, h('input', { type: 'checkbox', 'data-v': v.id, 'data-f': ESD, checked: !e.divisions || e.divisions.includes(ESD) ? true : null, 'aria-label': v.name + ' Electronic Security' })), h('td', {}, h('input', { type: 'checkbox', 'data-v': v.id, 'data-f': SOL, checked: !e.divisions || e.divisions.includes(SOL) ? true : null, 'aria-label': v.name + ' Solar' })), h('td', {}, h('input', { type: 'date', 'data-v': v.id, 'data-f': 'validTo', value: e.validTo || '', 'aria-label': v.name + ' approval valid to' }))]); });
+    const tbl = h('table', { class: 'tbl' }, [h('thead', {}, h('tr', {}, ['Vendor', 'Approved', 'Electronic Security', 'Solar', 'Approval valid to'].map((x) => h('th', {}, x)))), h('tbody', {}, rows)]);
+    c.appendChild(h('div', { class: 'stack' }, [callout('Approved wiring / installation contractors. Project setup only offers approved vendors for the project division, and blocks an expired or unapproved vendor.', 'info'), h('div', { class: 'table-wrap' }, tbl), saveBtn('Save approved vendors', () => {
+      const out = {}; vendors.forEach((v) => { const q = (f) => tbl.querySelector('input[data-v="' + v.id + '"][data-f="' + f + '"]'); out[v.id] = { approved: q('approved').checked, divisions: [ESD, SOL].filter((d) => q(d).checked), validTo: q('validTo').value || '' }; });
+      setCfg('projects.installVendors', out);
+    })]));
+  }
   const CFG_SECTIONS = [
+    { id: 'projects-vendors', title: 'Projects — approved installation vendors', roles: ['admin', 'gm'], render: cfgVendorRender },
+    { id: 'projects-stages', title: 'Projects — optional stages', roles: ['admin', 'gm', 'tech_head'], render: (c) => { const cb = h('input', { type: 'checkbox', checked: cfg('projects.positioningStage', true) !== false ? true : null, id: 'cfg-pos-stage' }); c.appendChild(h('div', { class: 'stack' }, [h('label', { class: 'check-row', for: 'cfg-pos-stage' }, [cb, ' Positioning & alignment is its own stage (after camera installation) for new large CCTV projects']), h('div', { class: 'small muted' }, 'Existing projects keep the workflow they were created with.'), saveBtn('Save', () => setCfg('projects.positioningStage', cb.checked))])); } },
     { id: 'projects-sla', title: 'Projects — stage SLAs, escalation & critical stages', roles: ['admin', 'gm'], render: cfgSlaRender },
     { id: 'projects-checklists', title: 'Projects — stage checklists (Technical Head approval)', roles: ['admin', 'tech_head'], render: cfgChecklistRender },
     { id: 'projects-compliance', title: 'Projects — net-metering & subsidy stage flows', roles: ['admin', 'gm', 'solar_coordinator', 'doc_coordinator'], render: cfgComplianceRender },

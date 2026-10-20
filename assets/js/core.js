@@ -13,6 +13,7 @@
   const COUNTER_KEY = 'mpcs-crm-v1-ids';
   const ROLE_KEY = 'mpcs-crm-role';
   const THEME_KEY = 'mpcs-crm-theme';
+  const BACKUP_KEY = 'mpcs-crm-last-backup';
   const TODAY = new Date(); TODAY.setHours(0, 0, 0, 0);
 
   // ---------------------------------------------------------------- safe storage
@@ -255,12 +256,18 @@
     },
   };
 
+  const AUDIT_ACTIONS = ['create', 'update', 'delete', 'view', 'denied', 'config', 'import', 'export'];
+  function auditSettings() { try { return Object.assign({ retentionDays: 365, maxEntries: 3000, actions: {} }, (state && state.__config && state.__config['audit.settings']) || {}); } catch (e) { return { retentionDays: 365, maxEntries: 3000, actions: {} }; } }
   function audit(action, col, id, note) {
     if (!state) return;
     let who = null;
     try { who = user(); } catch (e) { /* ignore */ }
+    const as = auditSettings();
+    if (action !== 'config' && as.actions && as.actions[action] === false) return; // config changes are always logged
     (state.audit = state.audit || []).push({ id: 'AUD-' + util.uid(), ts: new Date().toISOString(), role: who ? who.role : 'system', user: who ? who.name : 'system', userId: who ? who.id : null, action, col, recId: id, note });
-    if (state.audit.length > 3000) state.audit.splice(0, state.audit.length - 3000);
+    const max = Math.max(500, Number(as.maxEntries) || 3000);
+    if (state.audit.length > max) state.audit.splice(0, state.audit.length - max);
+    if (as.retentionDays > 0 && state.audit.length && (Date.now() - new Date(state.audit[0].ts).getTime()) > as.retentionDays * 864e5) { const cut = Date.now() - as.retentionDays * 864e5; state.audit = state.audit.filter((a) => new Date(a.ts).getTime() >= cut); }
     persist();
   }
 
@@ -427,6 +434,8 @@
     'sla.businessHours': true,
     'reports.enabled': {},
     'reports.defaultPeriod': 'This month',
+    'backup.reminderDays': 7,
+    'access.overrides': {},
   };
   const NOTIFY_EVENTS = [
     { id: 'general', label: 'General alerts', defaults: { inapp: true, email: false, whatsapp: false } },
@@ -561,7 +570,7 @@
       const pid = pageIdOfLink(link);
       const p = pages.find((x) => x.id === pid);
       const recRoles = toUser && toUser.length ? staffRoles(toUser) : to.flatMap((r) => (r === 'mgmt' ? MGMT : [r]));
-      if (p && recRoles.length && !recRoles.some((r) => p.roles.includes(r))) link = '';
+      if (p && recRoles.length && !recRoles.some((r) => pageAllows(p, r))) link = '';
     }
     const ch = config.channelsFor(n.event || 'general');
     const channels = [];
@@ -606,9 +615,19 @@
   function registerSeed(fn) { seeds.push(fn); }
   function registerRole(r) { if (!ROLES.some((x) => x.id === r.id)) { ROLES.push(r); ALL.push(r.id); } }
 
-  function visiblePages() { const r = currentRoleId(); return pages.filter((p) => !p.hidden && p.roles.includes(r)); }
+  // Role → page access: registered roles, adjusted by the admin's overrides (config 'access.overrides' = { pageId: { add: [roleIds], remove: [roleIds] } }).
+  // Admin can never lose an admin-only page (Users & Access, Settings) — that would lock everyone out.
+  const LOCKED_ADMIN_PAGES = ['users', 'settings'];
+  function pageAllows(p, roleId) {
+    if (!p) return false;
+    const ov = (config.get('access.overrides') || {})[p.id] || {};
+    if (roleId === 'admin' && LOCKED_ADMIN_PAGES.includes(p.id)) return true;
+    if ((ov.remove || []).includes(roleId)) return false;
+    return p.roles.includes(roleId) || (ov.add || []).includes(roleId);
+  }
+  function visiblePages() { const r = currentRoleId(); return pages.filter((p) => !p.hidden && pageAllows(p, r)); }
   /** canSee(pageId, roleId?) — can that role (default: current) open the page? 'home' is always allowed. */
-  function canSee(pageId, roleId) { if (!pageId || pageId === 'home') return true; const p = pages.find((x) => x.id === pageId); return !!p && p.roles.includes(roleId || currentRoleId()); }
+  function canSee(pageId, roleId) { if (!pageId || pageId === 'home') return true; const p = pages.find((x) => x.id === pageId); return !!p && pageAllows(p, roleId || currentRoleId()); }
 
   function safeDecode(s) { try { return decodeURIComponent(s); } catch (e) { return s; } }
   function parseRoute() {
@@ -638,7 +657,7 @@
       }
       const p = pages.find((x) => x.id === id);
       if (!p) { document.title = 'Page not found · ' + APP_TITLE; contentEl.innerHTML = '<div class="empty"><div class="big">🧭</div><h2>Page not found</h2><p><a href="#/home">Go to my dashboard</a></p></div>'; return; }
-      if (!p.roles.includes(currentRoleId())) {
+      if (!pageAllows(p, currentRoleId())) {
         document.title = 'Access restricted · ' + APP_TITLE;
         contentEl.innerHTML = '<div class="empty"><div class="big">🔒</div><h2>Access restricted</h2><p>The <b>' + util.esc(role().name) + '</b> role cannot open <b>' + util.esc(p.title) + '</b>.<br>Access follows role and assignment as defined in the requirement documents.</p><a class="btn primary" href="#/home">Back to my dashboard</a></div>';
         return;
@@ -846,7 +865,7 @@
     if (id === 'save') b.appendChild(ui.btn('Export backup', () => downloadBackup(), 'sm'));
   }
   function hideBanner(id) { const b = document.getElementById('banner-' + id); if (b) b.remove(); }
-  function downloadBackup() { downloadBlob('mpcs-crm-export-' + util.iso(new Date()) + '.json', new Blob([JSON.stringify(db.export(), null, 1)], { type: 'application/json' })); }
+  function downloadBackup() { try { ls.set(BACKUP_KEY, new Date().toISOString()); } catch (e) { /* ignore */ } audit('export', 'backup', 'JSON', 'Full JSON backup downloaded'); downloadBlob('mpcs-crm-export-' + util.iso(new Date()) + '.json', new Blob([JSON.stringify(db.export(), null, 1)], { type: 'application/json' })); }
   function downloadBlob(name, blob) {
     const url = URL.createObjectURL(blob);
     const a = h('a', { href: url, download: name, style: 'display:none' });
@@ -1823,6 +1842,7 @@
         const t = h('table', { class: 'tbl' }, [h('caption', { class: 'sr-only' }, 'Pages visible per role and module'), h('thead', {}, h('tr', {}, [h('th', { scope: 'col' }, 'Role')].concat(secs.map((s) => h('th', { scope: 'col' }, s))))), h('tbody', {}, ROLES.map((r) => h('tr', {}, [h('th', { scope: 'row' }, r.name)].concat(secs.map((s) => { const ps = pages.filter((p) => p.section === s); const n = ps.filter((p) => p.roles.includes(r.id)).length; return h('td', {}, n ? ui.badge(n === ps.length ? 'Full' : n + '/' + ps.length, n === ps.length ? 'ok' : 'info') : h('span', { class: 'muted' }, '—')); })))))]);
         matrix.appendChild(t);
         el.appendChild(h('div', { class: 'mt' }, ui.card('Access matrix (pages visible per role and module)', matrix, { flush: true })));
+        el.appendChild(h('div', { class: 'mt' }, accessEditor()));
       },
     });
 
@@ -1864,7 +1884,97 @@
     });
   }
 
+  /** Admin editor for role → page access. Saved as config 'access.overrides' (audited) and applied by canSee / navigation / routing. */
+  function accessEditor() {
+    const host = h('div', { class: 'stack' });
+    const list = pages.filter((p) => !p.hidden).sort((a, b) => (a.section + a.title).localeCompare(b.section + b.title));
+    const sel = h('select', { 'aria-label': 'Page' }, list.map((p) => h('option', { value: p.id }, p.section + ' › ' + p.title)));
+    const grid = h('div', { class: 'grid g4' });
+    function draw() {
+      grid.innerHTML = '';
+      const p = pages.find((x) => x.id === sel.value);
+      ROLES.forEach((r) => {
+        const id = 'acc_' + r.id + '_' + util.uid();
+        const locked = r.id === 'admin' && LOCKED_ADMIN_PAGES.includes(p.id);
+        const cb = h('input', { type: 'checkbox', id, 'data-role': r.id, checked: pageAllows(p, r.id) ? true : null, disabled: locked ? true : null });
+        grid.appendChild(h('label', { class: 'check-row', for: id }, [cb, ' ' + r.name + (p.roles.includes(r.id) ? '' : ' (added)')]));
+      });
+    }
+    sel.addEventListener('change', draw); draw();
+    const save = ui.btn('Save access for this page', () => {
+      const p = pages.find((x) => x.id === sel.value);
+      const all = Object.assign({}, config.get('access.overrides') || {});
+      const add = [], remove = [];
+      grid.querySelectorAll('input[data-role]').forEach((cb) => { const r = cb.getAttribute('data-role'); if (cb.checked && !p.roles.includes(r)) add.push(r); if (!cb.checked && p.roles.includes(r)) remove.push(r); });
+      if (add.length || remove.length) all[p.id] = { add, remove }; else delete all[p.id];
+      config.set('access.overrides', all, 'Page access for ' + p.title + ': ' + (add.length ? '+' + add.join(', +') : '') + (remove.length ? ' −' + remove.join(', −') : '') + (!add.length && !remove.length ? 'reset to default' : ''));
+      renderNav(parseRoute().id); ui.toast('Access saved for ' + p.title, 'ok'); draw();
+    }, 'primary');
+    const reset = ui.btn('Reset all overrides', () => ui.confirm('Reset page access', 'Every page goes back to the access its module registered. Continue?', () => { config.set('access.overrides', {}, 'Page access overrides reset'); renderNav(parseRoute().id); draw(); ui.toast('Access reset', 'ok'); }), 'sm');
+    const ov = config.get('access.overrides') || {};
+    host.appendChild(ui.callout('Grant or revoke a page per role. Changes apply immediately to the navigation, links and direct URLs, and are recorded in the audit log. Admin keeps Users & Access and Settings. Note: this is a client-side preview model, not a security boundary.', 'info'));
+    host.appendChild(h('div', { class: 'row' }, [h('label', { class: 'small' }, ['Page ', sel]), save, reset]));
+    host.appendChild(grid);
+    host.appendChild(h('div', { class: 'small muted' }, Object.keys(ov).length ? 'Overrides in force: ' + Object.keys(ov).map((k) => ((pages.find((x) => x.id === k) || {}).title || k)).join(', ') : 'No overrides — every page uses its registered roles.'));
+    return ui.card('Edit page access (role → page)', host);
+  }
+  // ---------------------------------------------------------------- integration log (simulated connectors) + backup reminder
+  const CONNECTOR = { whatsapp: 'WhatsApp Business API', email: 'E-mail (SMTP)', sms: 'SMS gateway' };
+  function logIntegration(e) {
+    if (!state) return null;
+    const rec = db.insert('integrationLog', Object.assign({ at: new Date().toISOString(), status: 'Simulated', attempts: 1 }, e), { silent: true, prefix: 'INT' });
+    const all = db.all('integrationLog'); if (all.length > 1000) state.integrationLog = all.slice(all.length - 1000);
+    return rec;
+  }
+  function wireIntegrationLog() {
+    on('customer.message', (m) => {
+      if (!m) return;
+      const ch = String(m.channel || 'SMS'); const kind = /whats/i.test(ch) ? 'whatsapp' : /mail/i.test(ch) ? 'email' : 'sms';
+      const c = m.customerId && master.customer(m.customerId);
+      const to = m.to || (c ? (kind === 'email' ? c.email : c.phone) : '');
+      const bad = !to ? 'No ' + (kind === 'email' ? 'e-mail address' : 'mobile number') + ' on the customer master' : kind !== 'email' && !validate.phone(to) ? 'Invalid mobile number ' + to : null;
+      logIntegration({ connector: CONNECTOR[kind], event: 'customer.message', template: m.template || '', ref: m.ref || '', customerId: m.customerId || null, to: to || '', status: bad ? 'Failed' : 'Simulated', error: bad || '' });
+    });
+    on('report.dispatch', (r) => { if (r) logIntegration({ connector: /whats/i.test(r.channel || '') ? CONNECTOR.whatsapp : CONNECTOR.email, event: 'report.dispatch', template: r.report + ' ' + (r.period || ''), ref: r.report, to: (r.recipients || []).join(', '), status: (r.recipients || []).length ? 'Simulated' : 'Failed', error: (r.recipients || []).length ? '' : 'No recipients configured' }); });
+    on('notifications:created', (n) => {
+      if (!booted || !n || !/simulated/i.test(n.channel || '')) return;
+      const users = n.toUser && n.toUser.length ? n.toUser.map((id) => db.get('staff', id)).filter(Boolean) : db.all('staff').filter((x) => x.active !== false && [].concat(n.to || []).flatMap((r) => (r === 'mgmt' ? MGMT : [r])).includes(x.role));
+      [['email', /Email/], ['whatsapp', /WhatsApp/]].forEach(([k, re]) => {
+        if (!re.test(n.channel)) return;
+        const addr = users.map((u) => (k === 'email' ? u.email : u.phone)).filter(Boolean);
+        logIntegration({ connector: CONNECTOR[k], event: 'notify:' + (n.event || 'general'), template: n.title, ref: n.id, to: addr.join(', '), status: addr.length ? 'Simulated' : 'Failed', error: addr.length ? '' : 'No ' + (k === 'email' ? 'e-mail' : 'mobile') + ' for the recipients' });
+      });
+    });
+    registerTick(() => {
+      const days = Number(config.get('backup.reminderDays')); if (!(days > 0)) return;
+      const last = ls.get(BACKUP_KEY); const age = last ? (Date.now() - new Date(last).getTime()) / 864e5 : Infinity;
+      if (age >= days) notify({ to: 'admin', title: 'Data backup due', body: last ? 'Last JSON backup ' + fmt.dateTime(last) + ' (' + Math.floor(age) + ' days ago)' : 'No JSON backup has been downloaded from this browser yet', link: '#/settings', severity: 'warn', key: 'backup-due-' + util.iso(new Date()), event: 'general' });
+      const failed = db.find('integrationLog', (x) => x.status === 'Failed' && Date.now() - new Date(x.at).getTime() < 864e5);
+      if (failed.length) notify({ to: 'admin', title: failed.length + ' integration message(s) failed in the last 24 h', body: Array.from(new Set(failed.map((x) => x.connector))).join(', '), link: '#/integrations', severity: 'warn', key: 'int-fail-' + util.iso(new Date()), event: 'general' });
+    }, 3600e3);
+  }
   function registerCoreConfigSections() {
+    registerConfigSection({
+      id: 'audit', title: 'Audit log settings', order: 60, roles: ['admin'],
+      render(el) {
+        const as = auditSettings();
+        const f = ui.form([{ key: 'retentionDays', label: 'Keep audit entries for (days, 0 = no limit)', type: 'number', min: 0, required: true }, { key: 'maxEntries', label: 'Maximum entries kept in this browser', type: 'number', min: 500, required: true }].concat(AUDIT_ACTIONS.map((a) => ({ key: 'a_' + a, label: 'Log "' + a + '" actions' + (a === 'config' ? ' (always on)' : ''), type: 'checkbox' }))), Object.assign({ retentionDays: as.retentionDays, maxEntries: as.maxEntries }, ...AUDIT_ACTIONS.map((a) => ({ ['a_' + a]: a === 'config' || as.actions[a] !== false }))));
+        el.appendChild(ui.card('Audit log', h('div', { class: 'stack' }, [ui.callout('Choose how long audit entries are kept and which actions are recorded. Settings changes are always audited.', 'info'), f, h('div', {}, ui.btn('Save audit settings', () => {
+          if (!f.validate()) return; const v = f.values();
+          const actions = {}; AUDIT_ACTIONS.forEach((a) => { actions[a] = a === 'config' ? true : !!v['a_' + a]; });
+          config.set('audit.settings', { retentionDays: Math.max(0, Number(v.retentionDays) || 0), maxEntries: Math.max(500, Number(v.maxEntries) || 3000), actions }, 'Audit settings: keep ' + v.retentionDays + ' days, off: ' + (AUDIT_ACTIONS.filter((a) => !actions[a]).join(', ') || 'none'));
+          ui.toast('Audit settings saved', 'ok');
+        }, 'primary'))])));
+      },
+    });
+    registerConfigSection({
+      id: 'backup', title: 'Backup & integration monitoring', order: 70, roles: ['admin'],
+      render(el) {
+        const last = ls.get(BACKUP_KEY);
+        const f = ui.form([{ key: 'days', label: 'Remind the administrator to back up every (days, 0 = off)', type: 'number', min: 0, required: true }], { days: config.get('backup.reminderDays') });
+        el.appendChild(ui.card('Scheduled backup reminder', h('div', { class: 'stack' }, [ui.callout('Data lives in this browser. A reminder is raised for the administrator when the last JSON backup is older than the interval. Failed simulated integration messages are listed under Administration › Integration log.', 'info'), h('div', { class: 'small' }, 'Last backup from this browser: ' + (last ? fmt.dateTime(last) : 'never')), f, h('div', { class: 'row' }, [ui.btn('Save', () => { if (!f.validate()) return; config.set('backup.reminderDays', Math.max(0, Number(f.values().days) || 0), 'Backup reminder every ' + f.values().days + ' days'); ui.toast('Saved', 'ok'); }, 'primary'), ui.btn('Download backup now', () => downloadBackup())])])));
+      },
+    });
     registerConfigSection({
       id: 'gst', title: 'GST rates', order: 10,
       render(el) {
@@ -2121,12 +2231,34 @@
   }
 
   // ---------------------------------------------------------------- boot
+  function registerIntegrationPage() {
+    registerPage({
+      id: 'integrations', title: 'Integration log', icon: '🔌', section: 'Administration', order: 98, roles: ['admin', 'gm'],
+      render(el) {
+        const rows = () => db.all('integrationLog').slice().reverse();
+        const all = rows(); const failed = all.filter((x) => x.status === 'Failed');
+        ui.page(el, { title: 'Integration log', sub: 'Every message the simulated connectors (WhatsApp Business API, e-mail, SMS) would have sent, with failures such as a missing mobile number or e-mail. Nothing leaves this browser.' });
+        el.appendChild(ui.kpis([{ label: 'Messages logged', value: all.length }, { label: 'Failed', value: failed.length, color: 'var(--bad)' }, { label: 'Failed (24 h)', value: failed.filter((x) => Date.now() - new Date(x.at).getTime() < 864e5).length, color: 'var(--warn)' }, { label: 'Connectors', value: Array.from(new Set(all.map((x) => x.connector))).length }]));
+        el.appendChild(ui.card(null, ui.table({ rows, exportName: 'integration-log.csv', caption: 'Integration log', filters: [{ key: 'status', label: 'statuses', options: ['Simulated', 'Failed', 'Resolved'] }, { key: 'connector', label: 'connectors', options: Object.values(CONNECTOR) }],
+          columns: [{ key: 'at', label: 'When', render: (x) => fmt.dateTime(x.at) }, { key: 'connector', label: 'Connector' }, { key: 'event', label: 'Event' }, { key: 'template', label: 'Message' }, { key: 'to', label: 'To' }, { key: 'status', label: 'Status', render: (x) => ui.badge(x.status, x.status === 'Failed' ? 'bad' : x.status === 'Resolved' ? 'ok' : 'info') }, { key: 'error', label: 'Error' }],
+          actions: (x) => (x.status === 'Failed' ? [ui.btn('Retry', () => {
+            const c = x.customerId && master.customer(x.customerId);
+            const to = c ? (/mail/i.test(x.connector) ? c.email : c.phone) : x.to;
+            if (to) { db.update('integrationLog', x.id, { status: 'Resolved', to, attempts: (x.attempts || 1) + 1, error: '', resolvedAt: new Date().toISOString() }, { note: 'Retried — sent (simulated)' }); ui.toast('Re-sent (simulated) to ' + to, 'ok'); }
+            else { db.update('integrationLog', x.id, { attempts: (x.attempts || 1) + 1 }, { silent: true }); ui.toast('Still failing: ' + x.error, 'bad'); }
+            refresh();
+          }, 'sm')] : []) }), { flush: true }));
+      },
+    });
+  }
   function boot() {
     load();
     const t = ls.get(THEME_KEY); if (t === 'dark' || t === 'light') document.documentElement.setAttribute('data-theme', t);
     registerCoreConfigSections();
     registerCoreImporters();
     registerCorePages();
+    registerIntegrationPage();
+    wireIntegrationLog();
     const fresh = !db.all('staff').length;
     seedMasters();
     if (fresh) {
