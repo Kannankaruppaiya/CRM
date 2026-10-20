@@ -805,7 +805,7 @@
     const wStart = hs.warrantyStart || sm.warrantyStart || p.handoverAt || isoD(p.closedAt || new Date());
     return (p.devices || []).map((d) => {
       const sk = stockBy(d.name) || {};
-      const wEnd = hs.warrantyEnd || isoD(addMonths(pd(wStart), warrantyMonths(d.type)));
+      const wEnd = hs.warrantyEnd || isoD(util.addDays(addMonths(pd(wStart), warrantyMonths(d.type)), -1)); // inclusive end, same convention as service assets
       return { productId: d.productId, name: d.name, make: sk.brand || null, brand: sk.brand || null, capacity: deviceCapacity(p, d) ? deviceCapacity(p, d) + (d.type === 'Battery' ? ' kWh' : ' kW') : null, model: sk.model || d.name, serial: d.serial, location: d.location, channel: d.channel, tag: d.tag, type: d.type, qty: 1, capacityKw: deviceCapacity(p, d), warrantyStart: wStart, warrantyEnd: wEnd, warrantyTerms: hs.warrantyTerms || (d.type === 'Module array' ? 'Product warranty 10 years / performance warranty 25 years (manufacturer)' : 'Manufacturer warranty against manufacturing defects; physical / surge damage excluded'), installDate: p.handoverAt || isoD(p.closedAt || new Date()) };
     });
   }

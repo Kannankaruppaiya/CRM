@@ -38,6 +38,9 @@ The switcher is a **client-side demo preview**. Anyone using the page can pick a
 - **Data Import** (Administration): a CSV importer with a downloadable template, row validation and an error report, for the collections each module registers (for example customers and products), plus Sales data migration. A full JSON export/import of all data is available under Master Data.
 - **Export:** report tables export to CSV. The Management Dashboard and the DRM/WRM/MRM reports produce a branded, print-ready document that you save as PDF from the browser's print dialog.
 - **Notifications & escalation:** an in-app notification bell, per-person and per-role alerts, and periodic SLA and escalation checks.
+- **Access & audit administration:** the admin can grant or revoke any page per role (Users & Access › Edit page access), and choose the audit-log retention and which actions are logged (Settings › Audit log settings).
+- **Backup & integration monitoring:** a scheduled reminder tells the admin when the last JSON backup is older than the configured interval, and the **Integration log** (Administration) lists every simulated WhatsApp / e-mail / SMS message, flags failures such as a missing mobile number, and offers a retry.
+- **Field evidence:** installation, service-report and PM photos and signatures are stored as attachments (not placeholders), and closure gates check that they exist. Engineers can raise a **Quick GRN** from the mobile view (with photo and barcode scan where the browser supports it).
 
 ## Integrations (simulated in this build)
 This is a dependency-free, browser-only build, so it does not connect to any external system. Each integration is **simulated** and labelled as such in the UI. The hook for a real connector is always the same: a **setting** in **Settings & Rules** plus an **event** on the `CRM.on(...)` bus that a backend adapter can subscribe to.

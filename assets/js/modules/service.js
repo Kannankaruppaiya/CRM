@@ -1641,7 +1641,7 @@
         if (n) ui.toast('Warranty & PM re-based on installation date ' + fmt.date(cc.installedAt) + ' for ' + n + ' asset(s)', 'ok');
       }
       CRM.notify({ to: ['service_coordinator'], title: 'SMS/WhatsApp to customer: Call closed + feedback link', body: 'Your request ' + c.id + ' is resolved. How did we do? Reply 1–5. — Team Maruthi', channel: 'SMS / WhatsApp', link: lk, key: 'cls-sms-' + c.id + '-' + (c.reopenCount || 0) });
-      ui.toast('Call ' + c.id + ' closed' + (c.chargeable ? ' · ' + fmt.money(c.charges) + ' sent to Accounts' : ''), 'ok'); CRM.refresh();
+      ui.toast('Call ' + c.id + ' closed' + (emitCharge ? ' · ' + fmt.money(c.charges) + ' sent to Accounts' : c.chargeable ? ' · already invoiced (' + fmt.money(c.charges) + ')' : ''), 'ok'); CRM.refresh();
     },
     feedback(c) {
       act(c, 'Customer feedback · ' + c.id, [
@@ -2193,7 +2193,10 @@
   function otsIssueStock(o) {
     if (!o || o.otsType !== 'Service OTS' || o.stockIssued) return;
     const words = [o.brand, o.capacity].filter((x) => x && x !== 'Other' && x !== 'Maruthi').map((x) => String(x).toLowerCase());
-    const st = db.all('stock').find((x) => { const n = String(x.name || '').toLowerCase(); return n.includes(String(o.productType || 'battery').toLowerCase().split(' ')[0]) && words.every((w) => n.includes(w)); }) || null;
+    const type = String(o.productType || 'Battery').toLowerCase().split(' ')[0];
+    const typeOk = (x) => { const pr = x.productId ? master.product(x.productId) : null; return String((pr && pr.category) || x.category || x.name || '').toLowerCase().includes(type) || String(x.name || '').toLowerCase().includes(type); };
+    const cands = words.length ? db.all('stock').filter((x) => { const n = String(x.name || '').toLowerCase(); return words.every((w) => n.includes(w)); }) : [];
+    const st = cands.find(typeOk) || cands[0] || null;
     CRM.emit('stock.issue.requested', { productId: st ? st.productId || null : null, stockId: st ? st.id : null, item: [o.qty + ' ×', o.productType, o.brand, o.capacity].filter(Boolean).join(' '), qty: Number(o.qty) || 1, toEngineer: o.assignedTo || o.createdBy, complaintId: o.complaintId || null, spareRequestId: 'OTS:' + o.id, otsId: o.id, division: o.division });
     db.update('ots', o.id, { stockIssued: true, stockItem: st ? st.id : null }, { note: st ? 'Stock issue requested: ' + st.name + ' × ' + o.qty : 'No matching stock item — stores to issue manually', silent: true });
     if (!st) CRM.notify({ to: ['stores'], title: 'Issue material for won OTS ' + o.id, body: [o.qty + ' ×', o.productType, o.brand, o.capacity].join(' ') + ' — no matching stock item found', link: '#/stock', severity: 'warn', key: 'ots-stk-' + o.id });

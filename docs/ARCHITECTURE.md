@@ -34,6 +34,7 @@ Scoping rules: a Sales Executive sees only their own leads; a Vendor sees only t
 | `products` | id `PRD-…`, division, category, name, price, unit, hsn, warrantyMonths, active |
 | `staff` | role, division, area, phone, email, **skills[]**, active, primary. The primary user id is `EMP-<roleId>`. |
 | `notifications`, `audit`, `attachments` | see the Core API |
+| `integrationLog` | every message the simulated connectors (WhatsApp Business API, e-mail, SMS) would send, with `status` Simulated / Failed / Resolved and the error (e.g. no mobile number). Page `#/integrations` (admin, GM). |
 
 Editable list masters, maintained in **Master Data**: `master.areas`, `master.segments`, `master.leadSources`, `master.paymentTerms` (`[{name, days}]`) and the division descriptions. Each array keeps its identity: an edit replaces its contents in place, so references a module already holds stay valid.
 
@@ -42,7 +43,7 @@ Editable list masters, maintained in **Master Data**: `master.areas`, `master.se
 |---|---|
 | sales | `enquiries`, `quotations`, `orders`, `invoices`, `payments`, `followups`, `dealers`, `upsells`, `targets`, `callLogs`, `checkins` (+ `salesFiles` only when `CRM.files` is absent, `salesConfig` only when `CRM.config` is absent). Sales also creates core `customers` and `sites` (a new customer captured on a lead, owned by the executive) and promotes a customer from New to Existing when its first SO is approved. |
 | projects | `projects` (ES large/small + Solar), `surveys`, `boqs`, `purchaseRequests`, `purchaseOrders`, `grns`, `stock`, `dcs`, `scrap`, `netMetering`, `subsidies`, `credVault` (references and access audit only, never secrets) |
-| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests`, `ots`, `amcOpportunities`, `serviceConfig`. It inserts a `scrap` record only as a fallback, when no `scrap.create.requested` listener created one. |
+| service | `assets` (installed equipment), `complaints`, `amcContracts`, `pmPlans`, `pmVisits`, `violations`, `escalations`, `feedback`, `spareRequests`, `ots`, `amcOpportunities`, `serviceTasks` (AMC follow-up tasks: one open task per opportunity, re-created on each logged follow-up), `serviceConfig`. It inserts a `scrap` record only as a fallback, when no `scrap.create.requested` listener created one. |
 | executive | none: it reads every collection and stores only `exec.*` config keys |
 
 A module reads other modules' collections but never writes them directly. Cross-module handoffs go through the event bus instead.
@@ -77,10 +78,11 @@ A module reads other modules' collections but never writes them directly. Cross-
 | `project.installation.created` | projects | `{ projectId, complaintId }` | service sets `complaint.projectId` |
 | `installation.updated` | service | `{ orderId, complaintId, status ('Pending'\|'Assigned'\|'In Progress'\|'Completed'\|'Closed'), installedAt, payment {mode,status,amount,date,balance,terms}, scrapCollected, dcRef, invoiceRef }`: the Power installation call was updated | sales updates the SO: `installationStatus` (Assigned → Scheduled, In Progress, Completed), `installationCompletionDate` (from `installedAt`), `deliveredDate`, `scrapCollected` and `installationCallId`. A Completed SO never moves back. |
 | `installation.completed` | service | `{ orderId, complaintId, completedAt, closedAt, payment, scrapCollected, scrapId, dcRef, invoiceRef }`: the installation call closed. Service has already re-based the warranty and PM plan on `completedAt`. | sales marks the SO installation Completed with that date. The resulting `orders:updated` is a no-op in service, so the two never loop. |
-| `stock.issue.requested` | service | `{ productId, stockId, item, qty, toEngineer, complaintId, spareRequestId, division }` | projects moves the qty from the warehouse or service centre into the engineer's stock (`moveStock`) and may raise a service DC (linkType 'Complaint') |
+| `stock.issue.requested` | service | `{ productId, stockId, item, qty, toEngineer, complaintId, spareRequestId, division }`; also emitted when a Service OTS is won (`spareRequestId: 'OTS:<id>'`, `otsId`) | projects moves the qty from the warehouse or service centre into the engineer's stock (`moveStock`) and may raise a service DC (linkType 'Complaint') |
 | `stock.return.requested` | service | `{ …same, qty (returned), fromEngineer }` | projects moves it from the engineer back to the service centre |
 | `stock.consumed` | service | `{ …same, engineerId }` (spare used at site) | projects consumes it from engineer stock. Service never writes `stock` and checks availability as `current - reserved`. |
 | `scrap.create.requested` | service | `{ linkType: 'Installation'\|'Complaint'\|'OTS', linkId, complaintId, orderId?, otsId?, grnId?, customerId, division, scrapType, qty, brand?, capacity?, trigger, source, status, location, collectedBy, storedAt }` | projects inserts the `scrap` record synchronously. If no record exists afterwards, service inserts one itself with the projects schema. |
+| `grn.service.requested` | service | `{ complaintId, customerId, division, contact, site, productType, brand, model, serial, qty, condition, accessories, problem, collectedBy, source }` (mobile Quick GRN) | projects inserts the Service GRN (`Pending Inward`) synchronously, one open GRN per complaint and serial; service then attaches the photo to the GRN (`CRM.files`, recordType `grns`) |
 | `service.centre.stage` | service | `{ complaintId, grnId, stage, stageName, grnStatus }` | projects advances the Service GRN when `grnStatus` is ahead (Pending Inward → Inward Created → Under Service → Ready for Dispatch → Delivered). Service pulls the reverse direction through `grns:updated`. |
 | `customer.message` | service | `{ channel, customerId, to, template, stage, text, ref }` | integration hook for WhatsApp/SMS (simulated) |
 | `report.dispatch` | executive | `{ report:'DRM'\|'WRM'\|'MRM', period, from, to, division, channel, recipients:[roleIds], summary:[{metric,value}] }` | integration hook for e-mail/WhatsApp report distribution (simulated) |
@@ -94,6 +96,10 @@ A module reads other modules' collections but never writes them directly. Cross-
 | service | `orders:updated` | Power SO edited by Sales: copies the installation date and scrap collection to the installation call and re-bases the warranty |
 | service | `grns:updated` | Service GRN status → service-centre stage of the linked complaint |
 | service | `notifications:created` | its own popup for severity `bad` (skipped when `CRM.notifyPopup` is true) |
+
+| core | `customer.message`, `report.dispatch`, `notifications:created` (simulated e-mail/WhatsApp) | writes `integrationLog`; a failed send (missing or invalid recipient) is logged as Failed and raises a daily admin alert |
+| service | `amcOpportunities:updated` | closes the opportunity's open follow-up task on Won / Lost, re-owns it on reassignment |
+| service | `project.installation.created` | sets `complaint.projectId` |
 
 Modules may add events. Add every new event to this table.
 
@@ -222,7 +228,7 @@ Settings page roles = admin + gm + every role named by a registered section. Eac
 | `reports.enabled` | `{}` (missing = enabled) | Report configuration |
 | `reports.defaultPeriod` | `'This month'` | " |
 
-Projects keys: `projects.stageDays`, `projects.criticalStages`, `projects.acceptSlaDays`, `projects.prInitDays`, `projects.escalation`, `projects.checklists`, `projects.nmFlows`, `projects.subFlows`, `projects.kpiTargets`, `projects.kpiExclude`, `projects.boqMatrix`, `projects.autoPR`, `projects.budget`, `projects.closure`, `projects.warranty`, `projects.engineerSkills`. Service also reads `channels.amcRenewal` and `channels.warrantyExpiry`. These are customer-facing channel lists (an **array** such as `['Email', 'WhatsApp', 'SMS']`), not the `{inapp,email,whatsapp}` object that core uses for its own event ids, and service edits them in its own section.
+Projects keys: `projects.installVendors` (approved installation vendors `{ staffId: { approved, divisions[], validTo } }`; unset = every active vendor user approved), `projects.positioningStage` (true: new large CCTV projects get a separate Positioning & alignment stage), `projects.stageDays`, `projects.criticalStages`, `projects.acceptSlaDays`, `projects.prInitDays`, `projects.escalation`, `projects.checklists`, `projects.nmFlows`, `projects.subFlows`, `projects.kpiTargets`, `projects.kpiExclude`, `projects.boqMatrix`, `projects.autoPR`, `projects.budget`, `projects.closure`, `projects.warranty`, `projects.engineerSkills`. Service also reads `channels.amcRenewal` and `channels.warrantyExpiry`. These are customer-facing channel lists (an **array** such as `['Email', 'WhatsApp', 'SMS']`), not the `{inapp,email,whatsapp}` object that core uses for its own event ids, and service edits them in its own section.
 Other module keys reported so far: sales `sales.sla`, `sales.escalation`, `sales.paymentEscalation`, `sales.reminders`, `sales.discount`, `sales.otsIncentive` (section `sales-rules`); service sections `service-sla`, `service-escalation`; executive `exec.violationPenalty` (1.5), `exec.coordinatorPenalty` (2), `exec.scoreWindowDays` (90), `exec.riskDays` (7), `exec.reportRecipients` (`['gm','odm']`), and it also reads `channels.report.dispatch` and `service.pmGraceDays`. Prefix your keys with your module name.
 
 ## 5. Business hours
@@ -328,7 +334,13 @@ The page offers: choose an importer, download a template, upload or paste CSV, v
 - `ui.keyActivate(el, fn, label)` makes any element keyboard-operable.
 - `ui.table` options: `caption`, `exportName`, `column.sortable:false`, `column.exportValue`. `ui.btn(label, fn, cls, attrs)` accepts extra attributes such as `aria-label`.
 
-## 12. Storage robustness
+## 12. Access overrides, audit settings, backup reminder
+- `access.overrides` = `{ pageId: { add: [roleIds], remove: [roleIds] } }`, edited by the admin under **Users & Access › Edit page access**. `canSee`, the navigation, notification links and direct URLs all apply it. Admin always keeps `users` and `settings`.
+- `audit.settings` = `{ retentionDays (365, 0 = no limit), maxEntries (3000), actions: { create, update, delete, view, denied, import, export: boolean } }` (Settings › Audit log settings). `config` changes are always audited.
+- `backup.reminderDays` (7, 0 = off): a tick alerts the admin when the last JSON backup downloaded from this browser (`mpcs-crm-last-backup`) is older than that.
+- Evidence (photos and signatures) is stored with `CRM.files`; a record keeps the reference `'ATT:<label>'` and closure / PM gates check that the attachment exists.
+
+## 13. Storage robustness
 - Writes are debounced (150 ms) and flushed on `pagehide`. Reset and import set a suspend flag, so a reload never writes the old state back.
 - Quota or blocked storage shows a persistent red **"Changes are not being saved"** banner with an export button.
 - **Multi-tab:** the `storage` event adopts the other tab's state, and re-renders, or shows a "Refresh view" banner while a dialog or field is in use. Id counters are re-read from `mpcs-crm-v1-ids` before every `nextId`. A reset in one tab reloads the others.

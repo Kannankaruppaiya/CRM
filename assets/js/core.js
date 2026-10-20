@@ -361,7 +361,7 @@
 
   function seedStaffForRole(r) {
     if (db.get('staff', 'EMP-' + r.id)) return;
-    db.insert('staff', { id: 'EMP-' + r.id, name: r.user, role: r.id, primary: true, phone: '98' + util.rand(10000000, 99999999), active: true, division: r.id === 'solar_coordinator' || r.id === 'doc_coordinator' ? 'Solar' : r.id === 'es_coordinator' ? 'Electronic Security' : r.id === 'service_centre_tech' ? 'Power' : null, skills: r.id === 'service_centre_tech' ? ['Inverter', 'Online UPS', 'Battery'] : undefined }, { silent: true });
+    db.insert('staff', { id: 'EMP-' + r.id, name: r.user, role: r.id, primary: true, phone: '98' + util.rand(10000000, 99999999), email: String(r.user).toLowerCase().replace(/[^a-z]+/g, '.').replace(/^\.|\.$/g, '') + '@maruthipower.example', active: true, division: r.id === 'solar_coordinator' || r.id === 'doc_coordinator' ? 'Solar' : r.id === 'es_coordinator' ? 'Electronic Security' : r.id === 'service_centre_tech' ? 'Power' : null, skills: r.id === 'service_centre_tech' ? ['Inverter', 'Online UPS', 'Battery'] : undefined }, { silent: true });
   }
 
   function seedMasters() {
@@ -376,7 +376,7 @@
     ];
     extra.forEach(([name, roleId, division, area]) => {
       if (!roleId) { const p = db.get('staff', 'EMP-sales_exec'); p.division = division; p.area = area; return; }
-      db.insert('staff', { name, role: roleId, primary: false, division, area, phone: '97' + util.rand(10000000, 99999999), active: true }, { silent: true });
+      db.insert('staff', { name, role: roleId, primary: false, division, area, phone: '97' + util.rand(10000000, 99999999), email: String(name).toLowerCase().replace(/[^a-z]+/g, '.').replace(/^\.|\.$/g, '') + '@maruthipower.example', active: true }, { silent: true });
     });
 
     PRODUCT_CATALOG.forEach(([division, category, name, price], i) => db.insert('products', { id: 'PRD-' + String(i + 1).padStart(3, '0'), division, category, name, price, unit: 'Nos', hsn: division === 'Solar' ? '8541' : division === 'Power' ? '8504' : '8525', warrantyMonths: division === 'Solar' ? 60 : 12, active: true }, { silent: true }));
